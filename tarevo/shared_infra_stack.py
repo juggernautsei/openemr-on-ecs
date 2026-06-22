@@ -111,9 +111,9 @@ class SharedInfraStack(Stack):
         _network.create_waf(self.alb, self.kms_key)
         #
         # Sprint 4.4 — Database
-        # self.aurora_cluster, self.aurora_admin_secret = _database.create_aurora(
-        #     self.vpc, self.aurora_sg, self.kms_key
-        # )
+        self.aurora_cluster, self.aurora_admin_secret = _database.create_aurora(
+            self.vpc, self.aurora_sg, self.kms_key
+        )
         # self.valkey_cluster = _database.create_valkey(self.vpc, self.valkey_sg, self.kms_key)
         # self.tenant_table   = _database.create_tenant_registry(self.kms_key)
         #
