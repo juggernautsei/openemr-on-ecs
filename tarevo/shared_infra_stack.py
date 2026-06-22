@@ -96,12 +96,16 @@ class SharedInfraStack(Stack):
         self.kms_key     = _security.create_kms_key()
         self.certificate = _security.create_certificate(self.zone)
         #
-        # Sprint 4.2 — Network
-        # self.vpc                                          = _network.create_vpc()
-        # alb_sg, aurora_sg, valkey_sg, container_sg        = _network.create_security_groups(self.vpc)
-        # self.alb_sg, self.aurora_sg, self.valkey_sg, self.container_sg = (
-        #     alb_sg, aurora_sg, valkey_sg, container_sg
-        # )
+        # Sprint 4.2 — Network (COMPLETE)
+        self.vpc = _network.create_vpc(self.kms_key)
+        (
+            self.alb_sg,
+            self.aurora_sg,
+            self.valkey_sg,
+            self.container_sg,
+        ) = _network.create_security_groups(self.vpc)
+        #
+        # Sprint 4.3 — ALB + WAF (next sub-task)
         # self.alb            = _network.create_alb(self.vpc, self.alb_sg)
         # self.https_listener = _network.add_https_listener(self.alb, self.certificate)
         # _network.create_waf(self.alb)

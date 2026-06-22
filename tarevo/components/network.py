@@ -9,13 +9,14 @@ from aws_cdk import RemovalPolicy
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_elasticloadbalancingv2 as elb
 from aws_cdk import aws_iam as iam
+from aws_cdk import aws_kms as kms
 from aws_cdk import aws_logs as logs
 from aws_cdk import aws_s3 as s3
 from aws_cdk import aws_wafv2 as wafv2
 from cdk_nag import NagSuppressions
 from constructs import Construct
 
-from ..constants import VPC_CIDR
+from ..constants import CONTAINER_PORT, VPC_CIDR
 
 
 class NetworkComponents:
@@ -51,40 +52,234 @@ class NetworkComponents:
         # Set by create_waf()
         self.waf_acl: Optional[wafv2.CfnWebACL] = None
 
-    # ── VPC ───────────────────────────────────────────────────────────────────
+    # ── VPC ────────────────────────────────────────────────────────────────────
 
-    def create_vpc(self) -> ec2.Vpc:
-        """Create VPC (2 AZs, public + private subnets) with flow logs.
+    def create_vpc(self, kms_key: kms.Key) -> ec2.Vpc:
+        """Create VPC 10.2.0.0/16 (2 AZs, public + private subnets) with flow logs.
+
+        Layout:
+            private subnets — Fargate tasks, Aurora, Valkey, Lambda provisioner
+            public subnets  — ALB only; NAT gateways provide private egress
+
+        Flow logs:
+            ALL traffic logged to CloudWatch Logs, encrypted with the
+            platform KMS key.  Retention: 1 year (satisfies HIPAA log
+            retention guidance for infrastructure logs).
+
+        Args:
+            kms_key: Platform CMK used to encrypt the flow log group.
 
         Returns:
             The created VPC.
-
-        TODO Sprint 4.1:
-            - 10.2.0.0/16, max_azs=2
-            - PRIVATE_WITH_EGRESS + PUBLIC (map_public_ip_on_launch=False)
-            - VPC flow logs → CloudWatch (use KMS key from SecurityComponents)
-            - Suppress HIPAA-VPCDefaultSecurityGroupClosed and IGW route warnings
         """
-        raise NotImplementedError("TODO Sprint 4.1: implement create_vpc()")
+        vpc = ec2.Vpc(
+            self.scope,
+            "Vpc",
+            ip_addresses=ec2.IpAddresses.cidr(VPC_CIDR),
+            max_azs=2,
+            subnet_configuration=[
+                ec2.SubnetConfiguration(
+                    name="private",
+                    subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS,
+                ),
+                ec2.SubnetConfiguration(
+                    name="public",
+                    subnet_type=ec2.SubnetType.PUBLIC,
+                    map_public_ip_on_launch=False,
+                ),
+            ],
+        )
 
-    # ── Security groups ───────────────────────────────────────────────────────
+        # ---- Flow logs -------------------------------------------------------
+        flow_log_group = logs.LogGroup(
+            self.scope,
+            "VpcFlowLogGroup",
+            encryption_key=kms_key,
+            retention=logs.RetentionDays.ONE_YEAR,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
 
-    def create_security_groups(self, vpc: ec2.Vpc) -> None:
+        flow_log_role = iam.Role(
+            self.scope,
+            "VpcFlowLogRole",
+            assumed_by=iam.ServicePrincipal("vpc-flow-logs.amazonaws.com"),
+        )
+
+        vpc.add_flow_log(
+            "FlowLog",
+            destination=ec2.FlowLogDestination.to_cloud_watch_logs(
+                flow_log_group, flow_log_role
+            ),
+            traffic_type=ec2.FlowLogTrafficType.ALL,
+        )
+
+        # ---- Nag suppressions ------------------------------------------------
+        NagSuppressions.add_resource_suppressions(
+            vpc,
+            [
+                {
+                    "id": "HIPAA.Security-VPCDefaultSecurityGroupClosed",
+                    "reason": (
+                        "Default SG is not used — all resources are assigned "
+                        "explicit, scoped security groups."
+                    ),
+                },
+            ],
+        )
+
+        for subnet in vpc.public_subnets:
+            NagSuppressions.add_resource_suppressions(
+                subnet,
+                [
+                    {
+                        "id": "HIPAA.Security-VPCNoUnrestrictedRouteToIGW",
+                        "reason": (
+                            "Public subnets need an IGW route for the shared "
+                            "internet-facing ALB.  Inbound traffic is restricted "
+                            "to HTTPS (443) only by the ALB security group."
+                        ),
+                    }
+                ],
+                apply_to_children=True,
+            )
+
+        NagSuppressions.add_resource_suppressions(
+            flow_log_role,
+            [
+                {
+                    "id": "HIPAA.Security-IAMNoInlinePolicy",
+                    "reason": (
+                        "CDK generates an inline DefaultPolicy on the flow-log "
+                        "IAM role for CloudWatch Logs permissions.  This is "
+                        "CDK-managed and follows least privilege."
+                    ),
+                },
+            ],
+            apply_to_children=True,
+        )
+
+        self.vpc = vpc
+        return vpc
+
+    # ── Security groups ─────────────────────────────────────────────────────
+
+    def create_security_groups(
+        self,
+        vpc: ec2.Vpc,
+    ) -> tuple[ec2.SecurityGroup, ec2.SecurityGroup, ec2.SecurityGroup, ec2.SecurityGroup]:
         """Create all platform-wide security groups.
 
-        Groups created:
-            alb_sg    — internet-facing; HTTPS in, allow_all_outbound=True
-            aurora_sg — no ingress at creation; tenants add their task SG
-            valkey_sg — no ingress at creation; tenants add their task SG
-            ecs_sg    — baseline shared SG; tenants create additional SGs
+        Returns a tuple of four security groups in this order:
+            (alb_sg, aurora_sg, valkey_sg, container_sg)
 
-        TODO Sprint 4.1:
-            - alb_sg: allow_all_outbound=True (Sprint 3 pattern)
-            - aurora_sg: allow_all_outbound=False; ingress added per-tenant
-            - valkey_sg: allow_all_outbound=False; ingress added per-tenant
-            - Suppress AwsSolutions-EC23 on alb_sg
+        alb_sg:
+            Internet-facing ALB.  HTTPS (443) ingress from 0.0.0.0/0 and
+            ::/0.  ``allow_all_outbound=True`` is intentional — it avoids
+            a CDK cross-stack circular dependency when TenantStack adds its
+            per-tenant task SG.  The ALB SG is in SharedInfraStack; the
+            task SG is in TenantStack.  If we tried to add an egress rule
+            from alb_sg to task_sg, CDK would create a cross-stack
+            dependency that CloudFormation refuses to delete in the right
+            order (confirmed in Sprint 3).
+
+        aurora_sg:
+            Aurora Serverless v2 cluster.  No ingress rules at stack
+            creation time.  TenantStack adds:
+                ``aurora_sg.connections.allow_from(task_sg, Port.tcp(3306))``
+
+        valkey_sg:
+            Valkey (ElastiCache Serverless).  Same pattern as aurora_sg.
+            TenantStack adds ingress on port 6379.
+
+        container_sg:
+            Baseline ECS task security group shared across tenants.
+            Accepts HTTPS (443) from alb_sg.  Each TenantStack
+            may create an additional per-tenant SG if finer isolation
+            is needed.
         """
-        raise NotImplementedError("TODO Sprint 4.1: implement create_security_groups()")
+        # ---- ALB SG ---------------------------------------------------------
+        alb_sg = ec2.SecurityGroup(
+            self.scope,
+            "AlbSg",
+            vpc=vpc,
+            description="Shared ALB - HTTPS inbound from internet",
+            # allow_all_outbound=True prevents cross-stack circular SG deps
+            # (confirmed pattern from Sprint 3 — see Notes in SPRINTS.md)
+            allow_all_outbound=True,
+        )
+        alb_sg.add_ingress_rule(
+            ec2.Peer.any_ipv4(),
+            ec2.Port.tcp(443),
+            "HTTPS from internet IPv4",
+        )
+        alb_sg.add_ingress_rule(
+            ec2.Peer.any_ipv6(),
+            ec2.Port.tcp(443),
+            "HTTPS from internet IPv6",
+        )
+
+        NagSuppressions.add_resource_suppressions(
+            alb_sg,
+            [
+                {
+                    "id": "AwsSolutions-EC23",
+                    "reason": (
+                        "Shared ALB is intentionally internet-facing on port 443 "
+                        "to serve all tenants via host-based routing."
+                    ),
+                },
+                {
+                    "id": "HIPAA.Security-EC2SecurityGroupIngressOpenToWorld",
+                    "reason": (
+                        "Internet-facing ALB must accept HTTPS (443) from the public "
+                        "internet.  All other ports are blocked."
+                    ),
+                },
+            ],
+        )
+
+        # ---- Aurora SG ------------------------------------------------------
+        # No ingress at creation — TenantStack adds port 3306 from its task SG.
+        aurora_sg = ec2.SecurityGroup(
+            self.scope,
+            "AuroraSg",
+            vpc=vpc,
+            description="Aurora cluster - MySQL ingress from ECS task SGs only",
+            allow_all_outbound=False,
+        )
+
+        # ---- Valkey SG ------------------------------------------------------
+        # No ingress at creation — TenantStack adds port 6379 from its task SG.
+        valkey_sg = ec2.SecurityGroup(
+            self.scope,
+            "ValkeySg",
+            vpc=vpc,
+            description="Valkey cluster - Redis ingress from ECS task SGs only",
+            allow_all_outbound=False,
+        )
+
+        # ---- Container SG ---------------------------------------------------
+        # Baseline task SG.  Accepts HTTPS from the ALB; tenants inherit this
+        # or create their own additional SG in TenantStack.
+        container_sg = ec2.SecurityGroup(
+            self.scope,
+            "ContainerSg",
+            vpc=vpc,
+            description="ECS container baseline SG - HTTPS from ALB",
+            allow_all_outbound=True,  # tasks need ECR, Secrets Manager, internet
+        )
+        container_sg.add_ingress_rule(
+            alb_sg,
+            ec2.Port.tcp(CONTAINER_PORT),
+            "HTTPS from shared ALB to OpenEMR containers",
+        )
+
+        self.alb_sg    = alb_sg
+        self.aurora_sg = aurora_sg
+        self.valkey_sg = valkey_sg
+        self.ecs_sg    = container_sg
+
+        return alb_sg, aurora_sg, valkey_sg, container_sg
 
     # ── ALB ───────────────────────────────────────────────────────────────────
 
