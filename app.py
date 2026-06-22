@@ -1,54 +1,53 @@
 #!/usr/bin/env python3
-"""CDK application entry point for the OpenEMR on AWS Fargate deployment."""
+"""CDK application entry point — Sprint 3 PoC branch: poc/l2-shared-alb.
+
+This branch is THROWAWAY.  It proves shared-ALB + host-header routing with
+L2 constructs before the Sprint 4 full production refactor.
+
+Stacks:
+  TarevoSharedInfra  — VPC, wildcard ACM cert, shared ALB/listener, ECS cluster
+  TarevoTenant-test-a — nginx stub service, listener rule host=test-a.tarevoehr.app
+  TarevoTenant-test-b — nginx stub service, listener rule host=test-b.tarevoehr.app
+"""
 
 import os
-import sys
 
 import aws_cdk as cdk
 from cdk_nag import AwsSolutionsChecks, HIPAASecurityChecks
 
-from openemr_ecs.stack import OpenemrEcsStack
+from tarevo.shared_infra_stack import SharedInfraStack
+from tarevo.tenant_stack import TenantStack
 
+app = cdk.App()
+cdk.Aspects.of(app).add(AwsSolutionsChecks(verbose=True))
+cdk.Aspects.of(app).add(HIPAASecurityChecks(verbose=True))
 
-def main() -> None:
-    """Build and synthesise the CDK application."""
-    app = cdk.App()
-    cdk.Aspects.of(app).add(AwsSolutionsChecks(verbose=True))
-    cdk.Aspects.of(app).add(HIPAASecurityChecks(verbose=True))
+env = cdk.Environment(
+    account=os.getenv("CDK_DEFAULT_ACCOUNT"),
+    region=os.getenv("CDK_DEFAULT_REGION"),
+)
 
-    # Derive the deployment environment from the CLI defaults so one synth template
-    # can target the account/region currently configured for the CDK user.
-    OpenemrEcsStack(
-        app,
-        "OpenemrEcsStack",
-        env=cdk.Environment(
-            account=os.getenv("CDK_DEFAULT_ACCOUNT"),
-            region=os.getenv("CDK_DEFAULT_REGION"),
-        ),
-    )
+# ── Shared infrastructure (one per platform) ──────────────────────────────────
+shared = SharedInfraStack(app, "TarevoSharedInfra", env=env)
 
-    # Emit CloudFormation templates and assets for all defined stacks.
-    app.synth()
+# ── Tenant A ──────────────────────────────────────────────────────────────────
+TenantStack(
+    app,
+    "TarevoTenant-test-a",
+    shared=shared,
+    tenant_id="test-a",
+    listener_priority=100,
+    env=env,
+)
 
+# ── Tenant B ──────────────────────────────────────────────────────────────────
+TenantStack(
+    app,
+    "TarevoTenant-test-b",
+    shared=shared,
+    tenant_id="test-b",
+    listener_priority=200,
+    env=env,
+)
 
-try:
-    main()
-except Exception as exc:
-    msg = str(exc)
-    # Detect configuration/validation errors and present them cleanly
-    if "Context validation failed" in msg or "validation" in msg.lower():
-        # Strip the wrapper prefix for a cleaner message
-        clean = msg.removeprefix("Context validation failed: ")
-        print(
-            "\n"
-            "╔══════════════════════════════════════════════════════════════╗\n"
-            "║                  CONFIGURATION ERROR                         ║\n"
-            "╚══════════════════════════════════════════════════════════════╝\n"
-            f"\n{clean}\n"
-            "\nEdit 'cdk.json' (context section) or pass values via:\n"
-            "  cdk deploy -c key=value\n"
-            "\nSee README.md for full configuration reference.\n",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    raise
+app.synth()
