@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""CDK application entry point — Sprint 3 PoC branch: poc/l2-shared-alb.
+"""CDK application entry point — Sprint 4 production branch: sprint/4-shared-infra-refactor.
 
-This branch is THROWAWAY.  It proves shared-ALB + host-header routing with
-L2 constructs before the Sprint 4 full production refactor.
+Production mode: only SharedInfraStack is instantiated here.
+Per-tenant stacks are provisioned on-demand via:
 
-Stacks:
-  TarevoSharedInfra  — VPC, wildcard ACM cert, shared ALB/listener, ECS cluster
-  TarevoTenant-test-a — nginx stub service, listener rule host=test-a.tarevoehr.app
-  TarevoTenant-test-b — nginx stub service, listener rule host=test-b.tarevoehr.app
+    python scripts/provision_tenant.py --tenant-id <id> --priority <int>
+
+This avoids bundling per-tenant CloudFormation stacks into the shared
+infra pipeline and lets each tenant be deployed/destroyed independently.
 """
 
 import os
@@ -16,7 +16,6 @@ import aws_cdk as cdk
 from cdk_nag import AwsSolutionsChecks, HIPAASecurityChecks
 
 from tarevo.shared_infra_stack import SharedInfraStack
-from tarevo.tenant_stack import TenantStack
 
 app = cdk.App()
 cdk.Aspects.of(app).add(AwsSolutionsChecks(verbose=True))
@@ -27,27 +26,9 @@ env = cdk.Environment(
     region=os.getenv("CDK_DEFAULT_REGION"),
 )
 
-# ── Shared infrastructure (one per platform) ──────────────────────────────────
-shared = SharedInfraStack(app, "TarevoSharedInfra", env=env)
-
-# ── Tenant A ──────────────────────────────────────────────────────────────────
-TenantStack(
-    app,
-    "TarevoTenant-test-a",
-    shared=shared,
-    tenant_id="test-a",
-    listener_priority=100,
-    env=env,
-)
-
-# ── Tenant B ──────────────────────────────────────────────────────────────────
-TenantStack(
-    app,
-    "TarevoTenant-test-b",
-    shared=shared,
-    tenant_id="test-b",
-    listener_priority=200,
-    env=env,
-)
+# ── Shared infrastructure — one instance per platform region ───────────────────────────
+# Deploys: KMS key, ACM cert, VPC, ALB, Aurora, Valkey, ECS cluster,
+#          tenant registry, provisioner Lambda.
+SharedInfraStack(app, "TarevoSharedInfra", env=env)
 
 app.synth()

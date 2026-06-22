@@ -1,0 +1,2 @@
+PyMySQL==1.1.1
+cfnresponse==1.1.4
