@@ -1,252 +1,125 @@
 """SharedInfraStack — shared infrastructure for all Tarevo tenants.
 
-Sprint 3 PoC: proves that a single ALB can route to multiple tenants via
-host-based listener rules using L2 CDK constructs (no L3 patterns).
+Sprint 4 production skeleton.  The stack shape (class-level type annotations
+and build-order comments) is defined here; actual resource creation is
+implemented incrementally in the component classes under tarevo/components/.
 
-Creates:
-  - VPC (2 AZs, public + private subnets)
-  - ALB security group allowing HTTPS from 0.0.0.0/0
-  - Internet-facing Application Load Balancer
-  - ACM wildcard certificate for *.tarevoehr.app (DNS validated via Route53)
-  - HTTPS listener on port 443 with a default 404 fixed-response action
-  - ECS cluster with container insights enabled
+NO component methods are called until they replace their ``raise
+NotImplementedError`` stubs — calling a stub would fail ``cdk synth``.
+
+Resources created (in this order once components are implemented):
+  1.  KMS customer-managed key (security)
+  2.  ACM wildcard certificate for *.tarevoehr.app (security)
+  3.  VPC 10.2.0.0/16, 2 AZs, public + private subnets (network)
+  4.  Security groups: ALB, Aurora, Valkey, container (network)
+  5.  Internet-facing ALB + WAF (network)
+  6.  HTTPS listener, default 404 (network)
+  7.  Aurora Serverless v2 cluster (database)
+  8.  Valkey (ElastiCache Serverless) cluster (database)
+  9.  Tenant registry DynamoDB table (database)
+  10. ECS cluster with container insights (compute)
+  11. Tenant DB provisioner Lambda + Custom Resource (provisioner)
+  12. SSM exports of all shared resource identifiers
 """
 
-from aws_cdk import CfnOutput, RemovalPolicy, Stack
+from typing import Optional
+
+from aws_cdk import Stack
 from aws_cdk import aws_certificatemanager as acm
+from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_ecs as ecs
-from aws_cdk import aws_elasticloadbalancingv2 as elb
-from aws_cdk import aws_iam as iam
-from aws_cdk import aws_logs as logs
+from aws_cdk import aws_elasticache as elasticache
+from aws_cdk import aws_elasticloadbalancingv2 as elbv2
+from aws_cdk import aws_kms as kms
+from aws_cdk import aws_lambda as _lambda
+from aws_cdk import aws_rds as rds
 from aws_cdk import aws_route53 as route53
-from aws_cdk import aws_s3 as s3
-from cdk_nag import NagSuppressions
 from constructs import Construct
 
-DOMAIN = "tarevoehr.app"
+from .components.compute import ComputeComponents
+from .components.database import DatabaseComponents
+from .components.network import NetworkComponents
+from .components.provisioner import ProvisionerComponents
+from .components.security import SecurityComponents
 
 
 class SharedInfraStack(Stack):
-    """Provision shared network + load-balancing infrastructure for Tarevo tenants."""
+    """Shared platform infrastructure consumed by every TenantStack.
 
-    # Public attributes consumed by TenantStack instances
-    vpc: ec2.Vpc
-    alb: elb.ApplicationLoadBalancer
-    alb_sg: ec2.SecurityGroup
-    https_listener: elb.ApplicationListener
-    cluster: ecs.Cluster
-    zone: route53.IHostedZone
+    All public attributes are set by component methods.  TenantStack reads
+    them via SSM parameters (not direct Python references) so there is no
+    CloudFormation cross-stack export dependency.
+    """
+
+    # ── Security ──────────────────────────────────────────────────────────────
+    kms_key:     Optional[kms.Key]             = None
+    certificate: Optional[acm.Certificate]     = None
+    zone:        Optional[route53.IHostedZone] = None
+
+    # ── Network ───────────────────────────────────────────────────────────────
+    vpc:              Optional[ec2.Vpc]                            = None
+    alb_sg:           Optional[ec2.SecurityGroup]                  = None
+    aurora_sg:        Optional[ec2.SecurityGroup]                  = None
+    valkey_sg:        Optional[ec2.SecurityGroup]                  = None
+    container_sg:     Optional[ec2.SecurityGroup]                  = None
+    alb:              Optional[elbv2.ApplicationLoadBalancer]       = None
+    https_listener:   Optional[elbv2.ApplicationListener]          = None
+
+    # ── Database ──────────────────────────────────────────────────────────────
+    aurora_cluster:       Optional[rds.DatabaseCluster]     = None
+    aurora_admin_secret:  Optional[object]                  = None   # SecretsManager Secret
+    valkey_cluster:       Optional[elasticache.CfnServerlessCache] = None
+    tenant_table:         Optional[dynamodb.Table]          = None
+
+    # ── Compute ───────────────────────────────────────────────────────────────
+    cluster: Optional[ecs.Cluster] = None
+
+    # ── Provisioner ───────────────────────────────────────────────────────────
+    provisioner_fn: Optional[_lambda.Function] = None
 
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        # ── VPC ──────────────────────────────────────────────────────────────
-        self.vpc = ec2.Vpc(
-            self,
-            "PocVpc",
-            ip_addresses=ec2.IpAddresses.cidr("10.1.0.0/16"),
-            max_azs=2,
-            subnet_configuration=[
-                ec2.SubnetConfiguration(
-                    name="private",
-                    subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS,
-                ),
-                ec2.SubnetConfiguration(
-                    name="public",
-                    subnet_type=ec2.SubnetType.PUBLIC,
-                    map_public_ip_on_launch=False,
-                ),
-            ],
-        )
+        # Instantiate component helpers (no AWS resources created yet)
+        _security    = SecurityComponents(self)
+        _network     = NetworkComponents(self)
+        _database    = DatabaseComponents(self)
+        _compute     = ComputeComponents(self)
+        _provisioner = ProvisionerComponents(self)
 
-        # VPC Flow Logs ── write to CloudWatch
-        flow_log_role = iam.Role(
-            self,
-            "FlowLogRole",
-            assumed_by=iam.ServicePrincipal("vpc-flow-logs.amazonaws.com"),
-        )
-        flow_log_group = logs.LogGroup(
-            self,
-            "FlowLogGroup",
-            retention=logs.RetentionDays.ONE_MONTH,
-            removal_policy=RemovalPolicy.DESTROY,
-        )
-        NagSuppressions.add_resource_suppressions(
-            flow_log_group,
-            [
-                {
-                    "id": "HIPAA.Security-CloudWatchLogGroupEncrypted",
-                    "reason": "PoC throwaway VPC flow log group — KMS encryption not required for this non-PHI diagnostic log.",
-                }
-            ],
-        )
-        ec2.CfnFlowLog(
-            self,
-            "VpcFlowLog",
-            resource_id=self.vpc.vpc_id,
-            resource_type="VPC",
-            traffic_type="ALL",
-            deliver_logs_permission_arn=flow_log_role.role_arn,
-            log_destination_type="cloud-watch-logs",
-            log_group_name=flow_log_group.log_group_name,
-        )
-
-        # cdk-nag: default SG is not used; suppress false-positive
-        NagSuppressions.add_resource_suppressions(
-            self.vpc,
-            [
-                {
-                    "id": "HIPAA.Security-VPCDefaultSecurityGroupClosed",
-                    "reason": (
-                        "Default SG is unused — all resources use explicitly "
-                        "scoped security groups."
-                    ),
-                }
-            ],
-        )
-        for subnet in self.vpc.public_subnets:
-            NagSuppressions.add_resource_suppressions(
-                subnet,
-                [
-                    {
-                        "id": "HIPAA.Security-VPCNoUnrestrictedRouteToIGW",
-                        "reason": (
-                            "Public subnets need an IGW route for the shared ALB. "
-                            "Inbound is restricted to HTTPS (443) only by ALB SG."
-                        ),
-                    }
-                ],
-                apply_to_children=True,
-            )
-
-        # ── ALB security group ────────────────────────────────────────────────
-        # allow_all_outbound=True so the ALB can forward to per-tenant task SGs
-        # in different stacks without creating cross-stack circular dependencies.
-        # Ingress is still restricted to HTTPS (port 443) only.
-        self.alb_sg = ec2.SecurityGroup(
-            self,
-            "AlbSg",
-            vpc=self.vpc,
-            description="Shared ALB - HTTPS inbound from internet",
-            allow_all_outbound=True,
-        )
-        self.alb_sg.add_ingress_rule(ec2.Peer.any_ipv4(), ec2.Port.tcp(443), "HTTPS from internet (IPv4)")
-        self.alb_sg.add_ingress_rule(ec2.Peer.any_ipv6(), ec2.Port.tcp(443), "HTTPS from internet (IPv6)")
-
-        NagSuppressions.add_resource_suppressions(
-            self.alb_sg,
-            [
-                {
-                    "id": "AwsSolutions-EC23",
-                    "reason": (
-                        "PoC shared ALB is intentionally internet-facing on port 443 "
-                        "to serve multiple tenants via host-based routing."
-                    ),
-                }
-            ],
-        )
-
-        # ── ALB access-log bucket ─────────────────────────────────────────────
-        log_bucket = s3.Bucket(
-            self,
-            "AlbLogBucket",
-            removal_policy=RemovalPolicy.DESTROY,
-            auto_delete_objects=True,
-            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
-            enforce_ssl=True,
-            versioned=False,
-        )
-        NagSuppressions.add_resource_suppressions(
-            log_bucket,
-            [
-                {
-                    "id": "AwsSolutions-S1",
-                    "reason": "ALB access-log bucket — server-access logging on the log bucket itself is not required.",
-                },
-                {
-                    "id": "HIPAA.Security-S3BucketLoggingEnabled",
-                    "reason": "ALB access-log bucket — self-referential logging not needed.",
-                },
-                {
-                    "id": "HIPAA.Security-S3BucketReplicationEnabled",
-                    "reason": "PoC throwaway bucket — cross-region replication not required.",
-                },
-                {
-                    "id": "HIPAA.Security-S3BucketVersioningEnabled",
-                    "reason": "PoC ALB log bucket — versioning not required for access logs.",
-                },
-                {
-                    "id": "HIPAA.Security-S3DefaultEncryptionKMS",
-                    "reason": "PoC ALB log bucket — KMS default encryption not required for throwaway access logs.",
-                },
-            ],
-        )
-
-        # ── Application Load Balancer ─────────────────────────────────────────
-        self.alb = elb.ApplicationLoadBalancer(
-            self,
-            "SharedAlb",
-            vpc=self.vpc,
-            internet_facing=True,
-            security_group=self.alb_sg,
-            drop_invalid_header_fields=True,
-            # deletion_protection=False for easy PoC destroy
-        )
-        self.alb.log_access_logs(log_bucket, prefix="alb-access-logs")
-
-        NagSuppressions.add_resource_suppressions(
-            self.alb,
-            [
-                {
-                    "id": "AwsSolutions-ELB2",
-                    "reason": "ALB access logs are enabled via log_access_logs().",
-                },
-                {
-                    "id": "HIPAA.Security-ELBDeletionProtectionEnabled",
-                    "reason": "PoC throwaway ALB — deletion protection intentionally disabled for easy sprint teardown.",
-                },
-            ],
-        )
-
-        # ── Wildcard ACM certificate for *.tarevoehr.app ──────────────────────
-        self.zone = route53.HostedZone.from_lookup(
-            self,
-            "TarevoZone",
-            domain_name=DOMAIN,
-        )
-
-        self.certificate = acm.Certificate(
-            self,
-            "WildcardCert",
-            domain_name=f"*.{DOMAIN}",
-            validation=acm.CertificateValidation.from_dns(self.zone),
-        )
-
-        # ── HTTPS listener — default action: 404 ──────────────────────────────
-        self.https_listener = self.alb.add_listener(
-            "HttpsListener",
-            port=443,
-            ssl_policy=elb.SslPolicy.RECOMMENDED_TLS,
-            certificates=[self.certificate],
-            default_action=elb.ListenerAction.fixed_response(
-                404,
-                content_type="text/plain",
-                message_body="No tenant matched this hostname.",
-            ),
-            open=False,  # SG ingress already configured above
-        )
-
-        # ── ECS Cluster ───────────────────────────────────────────────────────
-        self.cluster = ecs.Cluster(
-            self,
-            "SharedCluster",
-            vpc=self.vpc,
-            container_insights_v2=ecs.ContainerInsights.ENHANCED,
-            enable_fargate_capacity_providers=True,
-        )
-
-        # ── CloudFormation outputs ────────────────────────────────────────────
-        CfnOutput(self, "AlbDnsName", value=self.alb.load_balancer_dns_name)
-        CfnOutput(self, "ClusterName", value=self.cluster.cluster_name)
-        CfnOutput(self, "CertArn", value=self.certificate.certificate_arn)
+        # === Build sequence — uncomment each line as its Sprint 4.x task lands ===
+        #
+        # Sprint 4.1 — Security
+        # self.zone        = route53.HostedZone.from_lookup(self, "Zone", domain_name=DOMAIN)
+        # self.kms_key     = _security.create_kms_key()
+        # self.certificate = _security.create_certificate(self.zone)
+        #
+        # Sprint 4.2 — Network
+        # self.vpc                                          = _network.create_vpc()
+        # alb_sg, aurora_sg, valkey_sg, container_sg        = _network.create_security_groups(self.vpc)
+        # self.alb_sg, self.aurora_sg, self.valkey_sg, self.container_sg = (
+        #     alb_sg, aurora_sg, valkey_sg, container_sg
+        # )
+        # self.alb            = _network.create_alb(self.vpc, self.alb_sg)
+        # self.https_listener = _network.add_https_listener(self.alb, self.certificate)
+        # _network.create_waf(self.alb)
+        #
+        # Sprint 4.3 — Database
+        # self.aurora_cluster, self.aurora_admin_secret = _database.create_aurora(
+        #     self.vpc, self.aurora_sg, self.kms_key
+        # )
+        # self.valkey_cluster = _database.create_valkey(self.vpc, self.valkey_sg, self.kms_key)
+        # self.tenant_table   = _database.create_tenant_registry(self.kms_key)
+        #
+        # Sprint 4.4 — Compute
+        # self.cluster = _compute.create_cluster(self.vpc)
+        #
+        # Sprint 4.7 — Provisioner Lambda
+        # self.provisioner_fn = _provisioner.create_lambda(
+        #     self.vpc, self.aurora_sg, self.aurora_cluster,
+        #     self.aurora_admin_secret, self.kms_key,
+        # )
+        #
+        # Sprint 4.13 — SSM exports (all shared identifiers → SSM for TenantStack imports)
+        # _publish_ssm_exports(self)
