@@ -148,9 +148,10 @@ class TenantStack(Stack):
                 stream_prefix=tenant_id,
                 log_group=log_group,
             ),
-            # Minimal health-check at container level
+            # Minimal health-check at container level.
+            # Alpine-based nginx has wget but not curl.
             health_check=ecs.HealthCheck(
-                command=["CMD-SHELL", "curl -sf http://localhost/ || exit 1"],
+                command=["CMD-SHELL", "wget -q --spider http://localhost/ || exit 1"],
                 interval=Duration.seconds(30),
                 timeout=Duration.seconds(5),
                 retries=3,
