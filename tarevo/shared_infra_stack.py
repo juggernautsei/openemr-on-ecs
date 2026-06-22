@@ -128,7 +128,7 @@ class SharedInfraStack(Stack):
             self,
             "AlbSg",
             vpc=self.vpc,
-            description="Shared ALB — HTTPS inbound from internet",
+            description="Shared ALB - HTTPS inbound from internet",
             allow_all_outbound=True,
         )
         self.alb_sg.add_ingress_rule(ec2.Peer.any_ipv4(), ec2.Port.tcp(443), "HTTPS from internet (IPv4)")
