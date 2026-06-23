@@ -6,7 +6,7 @@ achieved at the database/user/key-prefix level, not the resource level.
 
 from typing import Optional
 
-from aws_cdk import Duration, RemovalPolicy, Stack
+from aws_cdk import CfnDeletionPolicy, Duration, RemovalPolicy, Stack
 from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_elasticache as elasticache
@@ -25,6 +25,8 @@ from ..constants import (
     MYSQL_PORT,
     SSM_AURORA_ENDPOINT,
     SSM_AURORA_SECRET_ARN,
+    SSM_TENANT_TABLE_NAME,
+    SSM_VALKEY_ENDPOINT,
     VALKEY_PORT,
 )
 
@@ -318,23 +320,107 @@ class DatabaseComponents:
         valkey_sg: ec2.SecurityGroup,
         kms_key: kms.Key,
     ) -> elasticache.CfnServerlessCache:
-        """Create a Valkey (Redis-compatible) Serverless cache.
+        """Create a shared Valkey (Redis-compatible) Serverless cache.
 
-        Shared across all tenants; tenants are isolated by key-prefix convention
-        (e.g. "test-a:" prefix on all OpenEMR session/cache keys).
+        Tenant isolation:
+            Each tenant namespaces its keys with a prefix (e.g. "acme-health:").
+            OpenEMR's session and cache layers must be configured with this
+            prefix at the Fargate task level.  No AWS-level key isolation is
+            available for ElastiCache Serverless.
+
+        Capacity limits (configurable — not hard AWS quotas):
+            max_data_storage : 10 GB  — enough for dozens of small tenants.
+            max_ecpu_per_second: 5 000 — ~5 r7g.large equivalent burst.
+            Both are soft ceilings; adjust when aggregate usage grows.
+
+        Encryption:
+            At-rest  : customer-managed KMS key.
+            In-transit: TLS enforced by ElastiCache Serverless (always on).
+
+        Removal policy:
+            CfnServerlessCache is an L1 construct; set via
+            cfn_options.deletion_policy=CfnDeletionPolicy.RETAIN.
 
         Returns:
             The created CfnServerlessCache.
-
-        TODO Sprint 4.5:
-            - engine="valkey", major_engine_version="8"
-            - ServerlessCacheConfiguration (max_data_storage, max_ecpu_per_second)
-            - subnet_ids = vpc private subnets
-            - security_group_ids = [valkey_sg.security_group_id]
-            - kms_key_id = kms_key.key_id
-            - Store endpoint in SSM
         """
-        raise NotImplementedError("TODO Sprint 4.5: implement create_valkey()")
+        private_subnet_ids = [
+            subnet.subnet_id
+            for subnet in vpc.private_subnets
+        ]
+
+        valkey = elasticache.CfnServerlessCache(
+            self.scope,
+            "ValkeyCluster",
+            engine="valkey",
+            major_engine_version="8",
+            serverless_cache_name="tarevo-shared-valkey",
+            description="Tarevo shared Valkey Serverless — all tenants, prefix-isolated",
+            subnet_ids=private_subnet_ids,
+            security_group_ids=[valkey_sg.security_group_id],
+            kms_key_id=kms_key.key_arn,
+            cache_usage_limits=elasticache.CfnServerlessCache.CacheUsageLimitsProperty(
+                data_storage=elasticache.CfnServerlessCache.DataStorageProperty(
+                    unit="GB",
+                    maximum=10,
+                ),
+                ecpu_per_second=elasticache.CfnServerlessCache.ECPUPerSecondProperty(
+                    maximum=5000,
+                ),
+            ),
+        )
+        # Retain cache data on CDK destroy so tenant session state isn’t lost.
+        valkey.cfn_options.deletion_policy = CfnDeletionPolicy.RETAIN
+
+        ssm.StringParameter(
+            self.scope,
+            "ValkeyEndpointParam",
+            parameter_name=SSM_VALKEY_ENDPOINT,
+            string_value=valkey.attr_endpoint_address,
+            description="Valkey Serverless primary endpoint address",
+        )
+
+        NagSuppressions.add_resource_suppressions(
+            valkey,
+            [
+                {
+                    "id": "AwsSolutions-AEC3",
+                    "reason": (
+                        "ElastiCache Serverless is always deployed in the VPC "
+                        "specified by subnet_ids.  The nag rule does not recognise "
+                        "the L1 CfnServerlessCache subnet property."
+                    ),
+                },
+                {
+                    "id": "AwsSolutions-AEC6",
+                    "reason": (
+                        "ElastiCache Serverless Valkey enforces TLS in-transit "
+                        "automatically.  AUTH tokens / passwords are not supported "
+                        "on ElastiCache Serverless; access is controlled by VPC "
+                        "security groups and IAM (future sprint)."
+                    ),
+                },
+                {
+                    "id": "HIPAA.Security-ElastiCacheRedisClusterAutomaticBackup",
+                    "reason": (
+                        "ElastiCache Serverless manages its own durability via "
+                        "multi-AZ replication; user-managed snapshots are not "
+                        "configurable on the Serverless tier."
+                    ),
+                },
+                {
+                    "id": "HIPAA.Security-ElastiCacheRedisInVPCOnly",
+                    "reason": (
+                        "ValkeyCluster is deployed in the private subnets of the "
+                        "Tarevo VPC.  The nag rule does not inspect the L1 "
+                        "CfnServerlessCache subnet_ids property."
+                    ),
+                },
+            ],
+        )
+
+        self.valkey_cluster = valkey
+        return valkey
 
     # ── DynamoDB tenant registry ──────────────────────────────────────────────
 
@@ -343,17 +429,64 @@ class DatabaseComponents:
 
         Schema:
             PK  tenant_id   (string)  — e.g. "acme-health"
-            Attributes:    subdomain, plan_tier, created_at, status,
-                           fargate_service_arn, db_secret_arn
+
+            Recommended attributes (not enforced by DynamoDB schema-less design):
+                subdomain         (S) — e.g. "acme-health.tarevoehr.app"
+                plan_tier         (S) — "basic" | "professional" | "enterprise"
+                created_at        (S) — ISO-8601 UTC timestamp
+                status            (S) — "provisioning" | "active" | "suspended" | "deprovisioned"
+                fargate_service_arn (S)
+                db_secret_arn     (S) — ARN of the tenant's per-user Secrets Manager secret
+
+        Durability:
+            PITR enabled — any item can be restored to any second within 35 days.
+            RemovalPolicy.RETAIN — CDK destroy never drops tenant records.
 
         Returns:
             The created Table.
-
-        TODO Sprint 4.5:
-            - billing_mode=PAY_PER_REQUEST
-            - encryption=TableEncryption.CUSTOMER_MANAGED (kms_key)
-            - point_in_time_recovery=True
-            - removal_policy=RETAIN (never accidentally drop tenant records)
-            - Store table name in SSM
         """
-        raise NotImplementedError("TODO Sprint 4.5: implement create_tenant_registry()")
+        table = dynamodb.Table(
+            self.scope,
+            "TenantRegistry",
+            table_name="tarevo-tenants",
+            partition_key=dynamodb.Attribute(
+                name="tenant_id",
+                type=dynamodb.AttributeType.STRING,
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            encryption=dynamodb.TableEncryption.CUSTOMER_MANAGED,
+            encryption_key=kms_key,
+            point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(
+                point_in_time_recovery_enabled=True,
+            ),
+            removal_policy=RemovalPolicy.RETAIN,
+        )
+
+        ssm.StringParameter(
+            self.scope,
+            "TenantTableNameParam",
+            parameter_name=SSM_TENANT_TABLE_NAME,
+            string_value=table.table_name,
+            description="DynamoDB tenant registry table name",
+        )
+
+        NagSuppressions.add_resource_suppressions(
+            table,
+            [
+                {
+                    "id": "HIPAA.Security-DynamoDBInBackupPlan",
+                    "reason": (
+                        "PITR is enabled on this table (35-day recovery window). "
+                        "Long-term archival via AWS Backup will be added in "
+                        "TenantStack (Sprint 4.13)."
+                    ),
+                },
+                {
+                    "id": "AwsSolutions-DDB3",
+                    "reason": "point_in_time_recovery=True IS enabled on this table.",
+                },
+            ],
+        )
+
+        self.tenant_table = table
+        return table
