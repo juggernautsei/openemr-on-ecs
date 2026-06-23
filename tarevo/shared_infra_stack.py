@@ -123,11 +123,11 @@ class SharedInfraStack(Stack):
         # Sprint 4.7 — ECS Cluster
         self.cluster = _compute.create_cluster(self.vpc, self.kms_key)
         #
-        # Sprint 4.7 — Provisioner Lambda
-        # self.provisioner_fn = _provisioner.create_lambda(
-        #     self.vpc, self.aurora_sg, self.aurora_cluster,
-        #     self.aurora_admin_secret, self.kms_key,
-        # )
+        # Sprint 4.8 — Provisioner Lambda
+        self.provisioner_fn = _provisioner.create_lambda(
+            self.vpc, self.aurora_sg, self.aurora_cluster,
+            self.aurora_admin_secret, self.kms_key,
+        )
         #
         # Sprint 4.13 — SSM exports (all shared identifiers → SSM for TenantStack imports)
         # _publish_ssm_exports(self)
