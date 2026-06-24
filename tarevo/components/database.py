@@ -102,7 +102,7 @@ class DatabaseComponents:
             self.scope,
             "AuroraParamGroup",
             engine=engine,
-            description="Tarevo shared Aurora MySQL — secure transport + query logging",
+            description="Tarevo shared Aurora MySQL - secure transport + query logging",
             parameters={
                 "require_secure_transport": "ON",
                 "slow_query_log":           "1",
@@ -355,7 +355,7 @@ class DatabaseComponents:
             engine="valkey",
             major_engine_version="8",
             serverless_cache_name="tarevo-shared-valkey",
-            description="Tarevo shared Valkey Serverless — all tenants, prefix-isolated",
+            description="Tarevo shared Valkey Serverless - all tenants, prefix-isolated",
             subnet_ids=private_subnet_ids,
             security_group_ids=[valkey_sg.security_group_id],
             kms_key_id=kms_key.key_arn,

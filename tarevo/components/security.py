@@ -62,7 +62,7 @@ class SecurityComponents:
         key = kms.Key(
             self.scope,
             "PlatformKey",
-            description="Tarevo platform CMK — Aurora, Valkey, EFS, S3, CW Logs, DDB, SecretsManager",
+            description="Tarevo platform CMK - Aurora, Valkey, EFS, S3, CW Logs, DDB, SecretsManager",
             enable_key_rotation=True,
             removal_policy=RemovalPolicy.DESTROY,
             pending_window=Duration.days(7),
@@ -102,7 +102,7 @@ class SecurityComponents:
             "KmsKeyArnParam",
             parameter_name=SSM_KMS_KEY_ARN,
             string_value=key.key_arn,
-            description="Platform CMK ARN — used by TenantStack to encrypt EFS and Secrets Manager",
+            description="Platform CMK ARN - used by TenantStack to encrypt EFS and Secrets Manager",
         )
 
         self.kms_key = key

@@ -335,7 +335,7 @@ class NetworkComponents:
             "ContainerSgIdParam",
             parameter_name=SSM_CONTAINER_SG_ID,
             string_value=container_sg.security_group_id,
-            description="ECS container task SG ID — used by TenantStack for EFS NFS access rules",
+            description="ECS container task SG ID - used by TenantStack for EFS NFS access rules",
         )
 
         self.alb_sg    = alb_sg
