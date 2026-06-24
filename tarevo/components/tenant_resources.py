@@ -22,6 +22,7 @@ from aws_cdk import aws_events as events
 from aws_cdk import aws_elasticloadbalancingv2 as elbv2
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_kms as kms
+from aws_cdk import aws_logs as logs
 from aws_cdk import aws_route53 as route53
 from aws_cdk import aws_secretsmanager as secretsmanager
 from cdk_nag import NagSuppressions
@@ -31,6 +32,12 @@ from ..constants import (
     BACKUP_RETENTION_DAYS,
     CONTAINER_PORT,
     DOMAIN,
+    ECR_IMAGE_URI,
+    FARGATE_CPU,
+    FARGATE_MEMORY,
+    MYSQL_PORT,
+    NFS_PORT,
+    VALKEY_PORT,
 )
 
 
@@ -297,45 +304,382 @@ class TenantResourcesComponents:
         return plan
 
     # ------------------------------------------------------------------ #
-    # 3. Fargate service                                                   #
+    # 3. Fargate service (Sprint 4.14 — COMPLETE)                         #
     # ------------------------------------------------------------------ #
     def create_fargate_service(
         self,
-        cluster: ecs.Cluster,
-        task_role: iam.Role,
-        exec_role: iam.Role,
+        vpc: ec2.IVpc,
+        cluster: ecs.ICluster,
         tenant_id: str,
+        kms_key: kms.IKey,
         aurora_secret_arn: str,
+        aurora_endpoint: str,
         valkey_endpoint: str,
         sites_fs: efs.FileSystem,
         ssl_fs: efs.FileSystem,
-        container_sg: ec2.SecurityGroup,
+        container_sg: ec2.ISecurityGroup,
+        aurora_sg: ec2.ISecurityGroup,
+        valkey_sg: ec2.ISecurityGroup,
     ) -> tuple[ecs.FargateService, elbv2.ApplicationTargetGroup]:
-        """Create a Fargate service running OpenEMR for this tenant.
+        """Create an ARM64 Fargate service running OpenEMR for this tenant.
 
-        Architecture: ARM64 (Graviton).
-        Image: from ECR (ECR_IMAGE_URI constant).
-        TLS terminated in-container on CONTAINER_PORT (443).
-        EFS mounts: /var/www/localhost/htdocs/openemr/sites (sites_fs),
-                    /etc/ssl (ssl_fs).
-        Environment variables injected at task definition time.
+        IAM:
+            task_role  — application identity (ECS Exec / SSM Messages).
+            exec_role  — ECS infrastructure identity (ECR pull, CloudWatch Logs
+                write, Secrets Manager read for Aurora credentials).
 
-        Health check: HTTPS GET /openemr/login.php — 2xx/3xx = healthy.
+        Container:
+            Image:  ECR_IMAGE_URI constant (Tarevo-branded OpenEMR ARM64).
+            Runtime: Linux ARM64 (Graviton) for cost efficiency.
+            Port:   CONTAINER_PORT (443) — OpenEMR terminates TLS internally.
+            EFS mounts:
+                sites_fs → /var/www/localhost/htdocs/openemr/sites
+                ssl_fs   → /etc/ssl
+            Non-secret config injected via ``environment`` dict.
+            Secrets (MySQL credentials) injected via ECS Secrets referencing
+            Secrets Manager fields — never appear as plain-text env vars.
+
+        Security-group wiring (deferred from create_efs; done here because
+        this is the first point all SGs are in scope together):
+            efs_sg    ← NFS (2049) from container_sg
+            aurora_sg ← MySQL (3306) from container_sg
+            valkey_sg ← Redis (6379) from container_sg
+
+        Target group:
+            HTTPS → port 443.  Health check: GET /openemr/login.php → 200–399.
 
         Returns:
             (FargateService, ApplicationTargetGroup)
-
-        TODO Sprint 4.10:
-            - TaskDefinition: cpu=512, memory_limit_mib=1024, runtime_platform=ARM64
-            - Container: ECR_IMAGE_URI, portMappings=[CONTAINER_PORT/tcp]
-            - Two EFS volumes + mount points
-            - FargateService: desired_count=1, security_groups=[container_sg],
-                vpc_subnets=PRIVATE_WITH_EGRESS
-            - ApplicationTargetGroup: protocol=HTTPS, port=CONTAINER_PORT,
-                health_check={path="/openemr/login.php", protocol=HTTPS}
-            - Suppress AwsSolutions-ECS2 (secrets via task env, not plain-text)
         """
-        raise NotImplementedError("TODO Sprint 4.10: implement create_fargate_service()")
+        # ---- Security-group wiring ------------------------------------------
+        self.efs_sg.add_ingress_rule(
+            container_sg,
+            ec2.Port.tcp(NFS_PORT),
+            "NFS from ECS container SG",
+        )
+        aurora_sg.add_ingress_rule(
+            container_sg,
+            ec2.Port.tcp(MYSQL_PORT),
+            "MySQL from ECS container SG",
+        )
+        valkey_sg.add_ingress_rule(
+            container_sg,
+            ec2.Port.tcp(VALKEY_PORT),
+            "Valkey from ECS container SG",
+        )
+
+        # ---- Container log group --------------------------------------------
+        # Encrypted with the platform CMK; the key policy already grants
+        # logs.{region}.amazonaws.com usage (AllowCloudWatchLogsEncryption
+        # added by SecurityComponents.create_kms_key).
+        log_group = logs.LogGroup(
+            self.scope,
+            f"{tenant_id.capitalize()}ContainerLogGroup",
+            log_group_name=f"/tarevo/ecs/{tenant_id}",
+            encryption_key=kms_key,
+            retention=logs.RetentionDays.ONE_YEAR,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        # ---- Task execution role (ECS infrastructure) -----------------------
+        # ECS uses this role (not the application) to pull images from ECR,
+        # inject Secrets Manager values at container start, and write logs.
+        exec_role = iam.Role(
+            self.scope,
+            f"{tenant_id.capitalize()}TaskExecRole",
+            role_name=f"{tenant_id}-task-exec",
+            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+        )
+        exec_role.add_managed_policy(
+            iam.ManagedPolicy.from_aws_managed_policy_name(
+                "service-role/AmazonECSTaskExecutionRolePolicy"
+            )
+        )
+        # Allow ECS to read the Aurora secret at container start
+        exec_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="ReadAuroraSecret",
+                actions=["secretsmanager:GetSecretValue"],
+                resources=[aurora_secret_arn],
+            )
+        )
+        # Decrypt KMS-protected secret values
+        exec_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="DecryptSecretsKms",
+                actions=["kms:Decrypt"],
+                resources=[kms_key.key_arn],
+            )
+        )
+
+        # ---- Task role (application identity) --------------------------------
+        # Grants ECS Exec (break-glass shell access) via SSM Messages.
+        task_role = iam.Role(
+            self.scope,
+            f"{tenant_id.capitalize()}TaskRole",
+            role_name=f"{tenant_id}-task-role",
+            assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+        )
+        task_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="EcsExecSsmMessages",
+                actions=[
+                    "ssmmessages:CreateControlChannel",
+                    "ssmmessages:CreateDataChannel",
+                    "ssmmessages:OpenControlChannel",
+                    "ssmmessages:OpenDataChannel",
+                ],
+                resources=["*"],
+            )
+        )
+
+        # ---- Fargate task definition ----------------------------------------
+        task_def = ecs.FargateTaskDefinition(
+            self.scope,
+            f"{tenant_id.capitalize()}TaskDef",
+            cpu=FARGATE_CPU,
+            memory_limit_mib=FARGATE_MEMORY,
+            task_role=task_role,
+            execution_role=exec_role,
+            runtime_platform=ecs.RuntimePlatform(
+                operating_system_family=ecs.OperatingSystemFamily.LINUX,
+                cpu_architecture=ecs.CpuArchitecture.ARM64,
+            ),
+        )
+
+        # ---- EFS volumes attached to the task definition --------------------
+        task_def.add_volume(
+            name="sites-volume",
+            efs_volume_configuration=ecs.EfsVolumeConfiguration(
+                file_system_id=sites_fs.file_system_id,
+                transit_encryption="ENABLED",
+            ),
+        )
+        task_def.add_volume(
+            name="ssl-volume",
+            efs_volume_configuration=ecs.EfsVolumeConfiguration(
+                file_system_id=ssl_fs.file_system_id,
+                transit_encryption="ENABLED",
+            ),
+        )
+
+        # ---- Reconstruct Aurora secret from ARN Token -----------------------
+        # aurora_secret_arn is a CDK Token (SSM-resolved at deploy time).
+        # from_secret_complete_arn() accepts Token ARNs and produces a valid
+        # ISecret that ecs.Secret.from_secrets_manager() can reference.
+        aurora_secret = secretsmanager.Secret.from_secret_complete_arn(
+            self.scope,
+            f"{tenant_id.capitalize()}AuroraSecretRef",
+            aurora_secret_arn,
+        )
+
+        # ---- Container definition -------------------------------------------
+        # environment: non-secret infrastructure addresses only.
+        #   No key name contains "password", "secret", or "key" — no ECS2 hit.
+        # secrets:     Aurora credentials via Secrets Manager field references.
+        #   ECS injects them as env vars at task start; never stored as plain text.
+        container = task_def.add_container(
+            "openemr",
+            image=ecs.ContainerImage.from_registry(ECR_IMAGE_URI),
+            container_name="openemr",
+            memory_limit_mib=FARGATE_MEMORY,
+            port_mappings=[
+                ecs.PortMapping(
+                    container_port=CONTAINER_PORT,
+                    protocol=ecs.Protocol.TCP,
+                )
+            ],
+            environment={
+                "MYSQL_HOST":     aurora_endpoint,
+                "MYSQL_PORT":     str(MYSQL_PORT),
+                "MYSQL_DATABASE": tenant_id,
+                "REDIS_SERVER":   valkey_endpoint,
+                "REDIS_PORT":     str(VALKEY_PORT),
+                "OE_SITE_DIR":    tenant_id,
+            },
+            secrets={
+                "MYSQL_ROOT_PASSWORD": ecs.Secret.from_secrets_manager(
+                    aurora_secret, field="password"
+                ),
+                "MYSQL_USER": ecs.Secret.from_secrets_manager(
+                    aurora_secret, field="username"
+                ),
+                "MYSQL_PASS": ecs.Secret.from_secrets_manager(
+                    aurora_secret, field="password"
+                ),
+            },
+            logging=ecs.LogDrivers.aws_logs(
+                stream_prefix=f"openemr-{tenant_id}",
+                log_group=log_group,
+            ),
+        )
+
+        # ---- EFS mount points in the container ------------------------------
+        container.add_mount_points(
+            ecs.MountPoint(
+                source_volume="sites-volume",
+                container_path="/var/www/localhost/htdocs/openemr/sites",
+                read_only=False,
+            )
+        )
+        container.add_mount_points(
+            ecs.MountPoint(
+                source_volume="ssl-volume",
+                container_path="/etc/ssl",
+                read_only=False,
+            )
+        )
+
+        # ---- Fargate service ------------------------------------------------
+        service = ecs.FargateService(
+            self.scope,
+            f"{tenant_id.capitalize()}Service",
+            service_name=f"{tenant_id}-openemr",
+            cluster=cluster,
+            task_definition=task_def,
+            desired_count=1,
+            min_healthy_percent=100,
+            security_groups=[container_sg],
+            vpc_subnets=ec2.SubnetSelection(
+                subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS,
+            ),
+            enable_execute_command=True,
+            assign_public_ip=False,
+        )
+
+        # ---- ALB target group -----------------------------------------------
+        target_group = elbv2.ApplicationTargetGroup(
+            self.scope,
+            f"{tenant_id.capitalize()}TargetGroup",
+            target_group_name=f"{tenant_id}-tg",
+            vpc=vpc,
+            protocol=elbv2.ApplicationProtocol.HTTPS,
+            port=CONTAINER_PORT,
+            targets=[service],
+            health_check=elbv2.HealthCheck(
+                protocol=elbv2.Protocol.HTTPS,
+                port=str(CONTAINER_PORT),
+                path="/openemr/login.php",
+                interval=Duration.seconds(30),
+                timeout=Duration.seconds(10),
+                healthy_threshold_count=2,
+                unhealthy_threshold_count=5,
+                healthy_http_codes="200-399",
+            ),
+            deregistration_delay=Duration.seconds(30),
+        )
+
+        # ---- Nag suppressions -----------------------------------------------
+        #
+        # exec_role: AmazonECSTaskExecutionRolePolicy (managed) + inline
+        #   AwsSolutions-IAM4: AWS-prescribed managed policy for Fargate execution
+        #     roles; no customer-managed alternative covers all required Fargate
+        #     ECR-pull, CloudWatch Logs, and Secrets Manager permissions.
+        #   AwsSolutions-IAM5: ecr:GetAuthorizationToken in the managed policy
+        #     genuinely requires resource "*" — authorization tokens are not
+        #     repository-scoped.
+        #   HIPAA.Security-IAMNoInlinePolicy: CDK-generated DefaultPolicy scoped
+        #     to the single Aurora secret ARN + KMS key — follows least privilege.
+        NagSuppressions.add_resource_suppressions(
+            exec_role,
+            [
+                {
+                    "id": "AwsSolutions-IAM4",
+                    "reason": (
+                        "AmazonECSTaskExecutionRolePolicy is the AWS-prescribed managed "
+                        "policy for Fargate execution roles.  No customer-managed policy "
+                        "covers all required ECR-pull, CloudWatch Logs, and Secrets Manager "
+                        "Fargate infrastructure permissions."
+                    ),
+                    "applies_to": [
+                        "Policy::arn:<AWS::Partition>:iam::aws:policy/"
+                        "service-role/AmazonECSTaskExecutionRolePolicy"
+                    ],
+                },
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "ecr:GetAuthorizationToken (from AmazonECSTaskExecutionRolePolicy) "
+                        "genuinely requires resource '*' — ECR auth tokens are not "
+                        "repository-scoped by design."
+                    ),
+                    "applies_to": ["Resource::*"],
+                },
+                {
+                    "id": "HIPAA.Security-IAMNoInlinePolicy",
+                    "reason": (
+                        "CDK DefaultPolicy on exec_role is scoped to the single Aurora "
+                        "secret ARN and the platform KMS key — least-privilege inline "
+                        "policy generated by CDK add_to_policy()."
+                    ),
+                },
+            ],
+            apply_to_children=True,
+        )
+
+        # task_role: inline SSM Messages policy (ECS Exec)
+        #   AwsSolutions-IAM5: ssmmessages actions require "*" — the service
+        #     does not support resource-level permission scoping.
+        #   HIPAA.Security-IAMNoInlinePolicy: CDK DefaultPolicy for ECS Exec;
+        #     follows the AWS ECS Exec documentation exactly.
+        NagSuppressions.add_resource_suppressions(
+            task_role,
+            [
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "ssmmessages:* actions required for ECS Exec break-glass access "
+                        "genuinely require resource '*' — SSM Messages does not support "
+                        "resource-level permission scoping."
+                    ),
+                    "applies_to": ["Resource::*"],
+                },
+                {
+                    "id": "HIPAA.Security-IAMNoInlinePolicy",
+                    "reason": (
+                        "CDK DefaultPolicy on task_role contains only the ECS Exec "
+                        "ssmmessages actions as documented by AWS."
+                    ),
+                },
+            ],
+            apply_to_children=True,
+        )
+
+        # task_def: non-secret environment variables
+        #   AwsSolutions-ECS2: environment dict contains only non-sensitive
+        #     infrastructure addresses (host/port values).  All secret values
+        #     (MySQL credentials) are injected via the ECS 'secrets' mechanism
+        #     using Secrets Manager field references — not plain-text env vars.
+        #   HIPAA.Security-ECSTaskDefinitionNoEnvironmentVariables: same
+        #     justification as ECS2 — values are configuration, not credentials.
+        NagSuppressions.add_resource_suppressions(
+            task_def,
+            [
+                {
+                    "id": "AwsSolutions-ECS2",
+                    "reason": (
+                        "environment dict contains only non-sensitive infrastructure "
+                        "addresses (MySQL host/port, Redis host/port, OE_SITE_DIR).  "
+                        "All MySQL credentials are injected via ECS Secrets (Secrets "
+                        "Manager field references) and never appear as plain-text env vars."
+                    ),
+                },
+                {
+                    "id": "HIPAA.Security-ECSTaskDefinitionNoEnvironmentVariables",
+                    "reason": (
+                        "environment dict contains only non-sensitive infrastructure "
+                        "addresses (MySQL host/port, Redis host/port, OE_SITE_DIR).  "
+                        "MySQL credentials are injected via ECS Secrets (Secrets Manager "
+                        "field references) and never appear as plain-text env vars."
+                    ),
+                },
+            ],
+            apply_to_children=True,
+        )
+
+        self.fargate_service = service
+        self.target_group    = target_group
+        return service, target_group
 
     # ------------------------------------------------------------------ #
     # 4. ALB listener rule                                                 #
