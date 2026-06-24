@@ -28,6 +28,7 @@ from aws_cdk import Duration, RemovalPolicy, Stack
 from aws_cdk import aws_certificatemanager as acm
 from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_ec2 as ec2
+from aws_cdk import aws_ecr as ecr
 from aws_cdk import aws_ecs as ecs
 from aws_cdk import aws_elasticache as elasticache
 from aws_cdk import aws_elasticloadbalancingv2 as elbv2
@@ -74,7 +75,8 @@ class SharedInfraStack(Stack):
     tenant_table:         Optional[dynamodb.Table]          = None
 
     # ── Compute ───────────────────────────────────────────────────────────────
-    cluster: Optional[ecs.Cluster] = None
+    cluster:  Optional[ecs.Cluster]     = None
+    ecr_repo: Optional[ecr.Repository] = None
 
     # ── Provisioner ───────────────────────────────────────────────────────────
     provisioner_fn: Optional[_lambda.Function] = None
@@ -128,6 +130,9 @@ class SharedInfraStack(Stack):
             self.vpc, self.aurora_sg, self.aurora_cluster,
             self.aurora_admin_secret, self.kms_key,
         )
+        #
+        # Sprint 4.10 — ECR repository
+        self.ecr_repo = _compute.create_ecr_repository()
         #
         # Sprint 4.9 — SSM exports (COMPLETE — inline in each component method)
         # All 17 parameters in constants.py are now exported:
