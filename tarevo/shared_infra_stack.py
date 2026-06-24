@@ -129,5 +129,14 @@ class SharedInfraStack(Stack):
             self.aurora_admin_secret, self.kms_key,
         )
         #
-        # Sprint 4.13 — SSM exports (all shared identifiers → SSM for TenantStack imports)
-        # _publish_ssm_exports(self)
+        # Sprint 4.9 — SSM exports (COMPLETE — inline in each component method)
+        # All 17 parameters in constants.py are now exported:
+        #   security  : SSM_KMS_KEY_ARN
+        #   network   : SSM_VPC_ID, SSM_PRIVATE_SUBNETS, SSM_ALB_SG_ID,
+        #               SSM_AURORA_SG_ID, SSM_VALKEY_SG_ID,
+        #               SSM_ALB_ARN, SSM_ALB_DNS, SSM_ALB_HOSTED_ZONE,
+        #               SSM_HTTPS_LISTENER_ARN
+        #   database  : SSM_AURORA_ENDPOINT, SSM_AURORA_SECRET_ARN,
+        #               SSM_VALKEY_ENDPOINT, SSM_TENANT_TABLE_NAME
+        #   compute   : SSM_CLUSTER_ARN, SSM_CLUSTER_NAME
+        #   provisioner: SSM_PROVISIONER_FN_ARN

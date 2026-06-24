@@ -5,7 +5,7 @@ Owns all L3/L4 network resources that are shared across every tenant.
 
 from typing import Optional
 
-from aws_cdk import RemovalPolicy, Stack
+from aws_cdk import Fn, RemovalPolicy, Stack
 from aws_cdk import aws_certificatemanager as acm
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_elasticloadbalancingv2 as elb
@@ -13,11 +13,24 @@ from aws_cdk import aws_iam as iam
 from aws_cdk import aws_kms as kms
 from aws_cdk import aws_logs as logs
 from aws_cdk import aws_s3 as s3
+from aws_cdk import aws_ssm as ssm
 from aws_cdk import aws_wafv2 as wafv2
 from cdk_nag import NagSuppressions
 from constructs import Construct
 
-from ..constants import CONTAINER_PORT, VPC_CIDR
+from ..constants import (
+    CONTAINER_PORT,
+    SSM_ALB_ARN,
+    SSM_ALB_DNS,
+    SSM_ALB_HOSTED_ZONE,
+    SSM_ALB_SG_ID,
+    SSM_AURORA_SG_ID,
+    SSM_HTTPS_LISTENER_ARN,
+    SSM_PRIVATE_SUBNETS,
+    SSM_VALKEY_SG_ID,
+    SSM_VPC_ID,
+    VPC_CIDR,
+)
 
 
 class NetworkComponents:
@@ -159,6 +172,25 @@ class NetworkComponents:
             apply_to_children=True,
         )
 
+        # ---- SSM exports -----------------------------------------------------
+        ssm.StringParameter(
+            self.scope,
+            "VpcIdParam",
+            parameter_name=SSM_VPC_ID,
+            string_value=vpc.vpc_id,
+            description="Shared VPC ID",
+        )
+        # Private subnet IDs joined as a comma-separated string.
+        # Fn.join() is used because subnet_id values are CDK Tokens;
+        # Python str.join() does not produce a valid CloudFormation expression.
+        ssm.StringParameter(
+            self.scope,
+            "PrivateSubnetsParam",
+            parameter_name=SSM_PRIVATE_SUBNETS,
+            string_value=Fn.join(",", [s.subnet_id for s in vpc.private_subnets]),
+            description="Comma-separated private subnet IDs (2 AZs)",
+        )
+
         self.vpc = vpc
         return vpc
 
@@ -275,6 +307,29 @@ class NetworkComponents:
             "HTTPS from shared ALB to OpenEMR containers",
         )
 
+        # ---- SSM exports -----------------------------------------------------
+        ssm.StringParameter(
+            self.scope,
+            "AlbSgIdParam",
+            parameter_name=SSM_ALB_SG_ID,
+            string_value=alb_sg.security_group_id,
+            description="Shared ALB security group ID",
+        )
+        ssm.StringParameter(
+            self.scope,
+            "AuroraSgIdParam",
+            parameter_name=SSM_AURORA_SG_ID,
+            string_value=aurora_sg.security_group_id,
+            description="Aurora cluster security group ID",
+        )
+        ssm.StringParameter(
+            self.scope,
+            "ValkeySgIdParam",
+            parameter_name=SSM_VALKEY_SG_ID,
+            string_value=valkey_sg.security_group_id,
+            description="Valkey cluster security group ID",
+        )
+
         self.alb_sg    = alb_sg
         self.aurora_sg = aurora_sg
         self.valkey_sg = valkey_sg
@@ -371,6 +426,29 @@ class NetworkComponents:
             ],
         )
 
+        # ---- SSM exports -----------------------------------------------------
+        ssm.StringParameter(
+            self.scope,
+            "AlbArnParam",
+            parameter_name=SSM_ALB_ARN,
+            string_value=alb.load_balancer_arn,
+            description="Shared ALB ARN",
+        )
+        ssm.StringParameter(
+            self.scope,
+            "AlbDnsParam",
+            parameter_name=SSM_ALB_DNS,
+            string_value=alb.load_balancer_dns_name,
+            description="Shared ALB DNS name (for Route53 alias records)",
+        )
+        ssm.StringParameter(
+            self.scope,
+            "AlbHostedZoneParam",
+            parameter_name=SSM_ALB_HOSTED_ZONE,
+            string_value=alb.load_balancer_canonical_hosted_zone_id,
+            description="Shared ALB canonical hosted zone ID (for Route53 alias records)",
+        )
+
         self.alb        = alb
         self.log_bucket = log_bucket
         return alb
@@ -407,6 +485,14 @@ class NetworkComponents:
                 message_body="No tenant matched this hostname.",
             ),
             open=False,
+        )
+
+        ssm.StringParameter(
+            self.scope,
+            "HttpsListenerArnParam",
+            parameter_name=SSM_HTTPS_LISTENER_ARN,
+            string_value=listener.listener_arn,
+            description="Shared HTTPS listener ARN (TenantStack adds host-header rules here)",
         )
 
         self.https_listener = listener

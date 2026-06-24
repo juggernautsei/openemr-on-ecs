@@ -7,10 +7,11 @@ from aws_cdk import aws_certificatemanager as acm
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_kms as kms
 from aws_cdk import aws_route53 as route53
+from aws_cdk import aws_ssm as ssm
 from cdk_nag import NagSuppressions
 from constructs import Construct
 
-from ..constants import DOMAIN
+from ..constants import DOMAIN, SSM_KMS_KEY_ARN
 
 
 class SecurityComponents:
@@ -94,6 +95,14 @@ class SecurityComponents:
                     "reason": "Annual automatic rotation IS enabled (enable_key_rotation=True).",
                 },
             ],
+        )
+
+        ssm.StringParameter(
+            self.scope,
+            "KmsKeyArnParam",
+            parameter_name=SSM_KMS_KEY_ARN,
+            string_value=key.key_arn,
+            description="Platform CMK ARN — used by TenantStack to encrypt EFS and Secrets Manager",
         )
 
         self.kms_key = key
