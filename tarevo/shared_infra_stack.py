@@ -15,7 +15,7 @@ Resources created (85 CloudFormation resources, zero nag errors):
   9.  Tenant registry DynamoDB table (database — Sprint 4.6)
   10. ECS cluster with enhanced container insights (compute — Sprint 4.7)
   11. Tenant DB provisioner Lambda (provisioner — Sprint 4.8)
-  12. SSM exports of all 18 shared resource identifiers (inline — Sprint 4.9)
+  12. SSM exports of all 19 shared resource identifiers (inline — Sprints 4.9/4.12)
   13. ECR repository tarevo-openemr (compute — Sprint 4.10)
 """
 
@@ -132,10 +132,10 @@ class SharedInfraStack(Stack):
         self.ecr_repo = _compute.create_ecr_repository()
         #
         # Sprint 4.9 — SSM exports (COMPLETE — inline in each component method)
-        # All 18 parameters in constants.py are exported:
+        # Sprint 4.12 added SSM_CONTAINER_SG_ID (network) — total 19 parameters:
         #   security  : SSM_KMS_KEY_ARN
         #   network   : SSM_VPC_ID, SSM_PRIVATE_SUBNETS, SSM_ALB_SG_ID,
-        #               SSM_AURORA_SG_ID, SSM_VALKEY_SG_ID,
+        #               SSM_AURORA_SG_ID, SSM_VALKEY_SG_ID, SSM_CONTAINER_SG_ID,
         #               SSM_ALB_ARN, SSM_ALB_DNS, SSM_ALB_HOSTED_ZONE,
         #               SSM_HTTPS_LISTENER_ARN
         #   database  : SSM_AURORA_ENDPOINT, SSM_AURORA_SECRET_ARN,
