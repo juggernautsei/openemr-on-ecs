@@ -94,24 +94,38 @@ class ProvisionerComponents:
             description="Provisioner Lambda - outbound to Aurora and AWS APIs",
             allow_all_outbound=False,
         )
-        # MySQL to Aurora cluster
-        provisioner_sg.add_egress_rule(
-            ec2.Peer.security_group_id(aurora_sg.security_group_id),
-            ec2.Port.tcp(MYSQL_PORT),
-            "MySQL to Aurora writer endpoint",
-        )
-        # HTTPS to AWS APIs (Secrets Manager, CloudWatch) via NAT gateway
+        # HTTPS egress: Secrets Manager + CloudWatch via NAT gateway (CIDR peer — no cycle risk)
         provisioner_sg.add_egress_rule(
             ec2.Peer.any_ipv4(),
             ec2.Port.tcp(443),
             "HTTPS to AWS APIs via NAT gateway",
         )
 
-        # Allow Aurora to accept inbound from the provisioner
-        aurora_sg.add_ingress_rule(
-            ec2.Peer.security_group_id(provisioner_sg.security_group_id),
-            ec2.Port.tcp(MYSQL_PORT),
-            "Provisioner Lambda MySQL access",
+        # MySQL rules use standalone L1 Cfn resources instead of inline add_egress_rule /
+        # add_ingress_rule.  Using ec2.Peer.security_group_id() embeds each SG's ID as a
+        # CloudFormation property of the *other* SG, creating an AuroraSg ↔ ProvisionerSg
+        # circular dependency that CloudFormation refuses to deploy.  Standalone
+        # CfnSecurityGroupEgress / CfnSecurityGroupIngress resources have their OWN logical
+        # IDs and depend on BOTH SGs rather than being part of either — no cycle.
+        ec2.CfnSecurityGroupEgress(
+            self.scope,
+            "ProvisionerSgMysqlEgress",
+            ip_protocol="tcp",
+            from_port=MYSQL_PORT,
+            to_port=MYSQL_PORT,
+            group_id=provisioner_sg.security_group_id,
+            destination_security_group_id=aurora_sg.security_group_id,
+            description="MySQL egress from Provisioner Lambda to Aurora writer",
+        )
+        ec2.CfnSecurityGroupIngress(
+            self.scope,
+            "AuroraSgFromProvisionerIngress",
+            ip_protocol="tcp",
+            from_port=MYSQL_PORT,
+            to_port=MYSQL_PORT,
+            group_id=aurora_sg.security_group_id,
+            source_security_group_id=provisioner_sg.security_group_id,
+            description="MySQL ingress on Aurora SG from Provisioner Lambda",
         )
 
         # ---- Lambda function -------------------------------------------------
