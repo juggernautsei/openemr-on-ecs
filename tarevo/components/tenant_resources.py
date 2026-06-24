@@ -13,11 +13,12 @@ Build order (called from TenantStack.__init__):
 
 from typing import Optional
 
-from aws_cdk import RemovalPolicy
+from aws_cdk import Duration, RemovalPolicy
 from aws_cdk import aws_backup as backup
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_ecs as ecs
 from aws_cdk import aws_efs as efs
+from aws_cdk import aws_events as events
 from aws_cdk import aws_elasticloadbalancingv2 as elbv2
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_kms as kms
@@ -155,29 +156,34 @@ class TenantResourcesComponents:
         )
 
         # ---- Nag suppressions ------------------------------------------------
-        # AwsSolutions-EFS1 + HIPAA.Security-EFSInBackupPlan:
-        # Neither automatic EFS backups nor an AWS Backup plan exists yet.
-        # A custom 7-year AWS Backup plan is created in create_backup_plan()
-        # (Sprint 4.13), satisfying HIPAA 7-year retention.  EFS automatic
-        # backups (max 35 days) are intentionally disabled in favour of the
-        # custom plan.
+        # AwsSolutions-EFS1: CDK does not propagate the AWS Backup plan
+        # enrollment back to the EFS resource's BackupPolicy CloudFormation
+        # attribute, so this rule fires even when EFS is enrolled in a plan.
+        # Both volumes ARE covered by the custom 7-year plan created in
+        # create_backup_plan() (Sprint 4.13).
+        #
+        # HIPAA.Security-EFSInBackupPlan: cdk-nag checks the EFS resource's
+        # BackupPolicy attribute, not plan enrollment via BackupSelection.
+        # The suppression is documented; the actual backup plan satisfies the
+        # HIPAA requirement at deploy time.
         _backup_suppressions = [
             {
                 "id": "AwsSolutions-EFS1",
                 "reason": (
-                    "Automatic EFS backups disabled intentionally.  A custom "
-                    "7-year AWS Backup plan covering both volumes is created "
-                    "in create_backup_plan() (Sprint 4.13) to meet HIPAA "
-                    "retention requirements beyond the 35-day automatic window."
+                    "Automatic EFS backups disabled; both volumes are enrolled "
+                    "in a custom 7-year AWS Backup plan (create_backup_plan, "
+                    "Sprint 4.13) that exceeds the 35-day automatic window. "
+                    "CDK does not set BackupPolicy=ENABLED on the EFS resource "
+                    "when enrolling via BackupSelection."
                 ),
             },
             {
                 "id": "HIPAA.Security-EFSInBackupPlan",
                 "reason": (
-                    "EFS volumes will be enrolled in a custom AWS Backup plan "
-                    "with 7-year retention in create_backup_plan() (Sprint 4.13). "
-                    "Plan creation is deferred to keep each sprint focused on "
-                    "a single deliverable."
+                    "Both EFS volumes are enrolled in a custom 7-year AWS Backup "
+                    "plan via BackupSelection (Sprint 4.13). cdk-nag checks the "
+                    "EFS BackupPolicy attribute rather than BackupSelection "
+                    "membership, so this finding persists despite actual coverage."
                 ),
             },
         ]
@@ -190,30 +196,105 @@ class TenantResourcesComponents:
         return sites_fs, ssl_fs
 
     # ------------------------------------------------------------------ #
-    # 2. Backup                                                            #
+    # 2. Backup (Sprint 4.13 — COMPLETE)                                  #
     # ------------------------------------------------------------------ #
     def create_backup_plan(
         self,
         sites_fs: efs.FileSystem,
         ssl_fs: efs.FileSystem,
         tenant_id: str,
+        kms_key: kms.IKey,
     ) -> backup.BackupPlan:
-        """Create a 7-year backup plan for tenant EFS volumes.
+        """Create a 7-year HIPAA-compliant backup plan for tenant EFS volumes.
 
-        Retention: BACKUP_RETENTION_DAYS (2555 = 7 years).
-        Schedule: daily at 03:00 UTC.
-        Move to cold storage after 90 days.
+        Vault:
+            A dedicated per-tenant backup vault encrypted with the platform
+            KMS CMK.  ``RemovalPolicy.RETAIN`` prevents accidental loss of
+            recovery points when a tenant stack is destroyed.
+
+        Rule schedule and retention:
+            Daily at 03:00 UTC (off-peak for clinics in US time zones).
+            Move to cold storage after 90 days — reduces storage cost while
+            keeping older backups accessible for compliance investigations.
+            Delete after 2555 days (7 years) — satisfies HIPAA minimum
+            retention for medical record backups (45 CFR 164.530(j)).
+            1-hour start window; 3-hour completion window — generous
+            windows for large OpenEMR sites directories.
+
+        Selection:
+            Both ``sites_fs`` (patient docs + config) and ``ssl_fs``
+            (TLS certificates) are enrolled via a BackupSelection resource.
 
         Returns:
             BackupPlan
-
-        TODO Sprint 4.9:
-            - BackupPlan.daily35_day_retention() is NOT enough — build custom plan
-            - Rule: move_to_cold_storage_after=Duration.days(90),
-                    delete_after=Duration.days(BACKUP_RETENTION_DAYS)
-            - Add both sites_fs and ssl_fs as resources
         """
-        raise NotImplementedError("TODO Sprint 4.9: implement create_backup_plan()")
+        # ---- Per-tenant backup vault -----------------------------------------
+        vault = backup.BackupVault(
+            self.scope,
+            f"{tenant_id.capitalize()}BackupVault",
+            backup_vault_name=f"{tenant_id}-backup",
+            encryption_key=kms_key,
+            removal_policy=RemovalPolicy.RETAIN,
+        )
+
+        # ---- Backup plan with custom 7-year rule -----------------------------
+        plan = backup.BackupPlan(
+            self.scope,
+            f"{tenant_id.capitalize()}BackupPlan",
+            backup_plan_name=f"{tenant_id}-efs-7yr",
+            backup_plan_rules=[
+                backup.BackupPlanRule(
+                    backup_vault=vault,
+                    rule_name=f"{tenant_id}-daily",
+                    schedule_expression=events.Schedule.cron(
+                        minute="0",
+                        hour="3",
+                    ),
+                    start_window=Duration.hours(1),
+                    completion_window=Duration.hours(3),
+                    move_to_cold_storage_after=Duration.days(90),
+                    delete_after=Duration.days(BACKUP_RETENTION_DAYS),
+                ),
+            ],
+        )
+
+        # ---- Enroll both EFS file systems ------------------------------------
+        plan.add_selection(
+            f"{tenant_id.capitalize()}EfsSelection",
+            backup_selection_name=f"{tenant_id}-efs",
+            resources=[
+                backup.BackupResource.from_efs_file_system(sites_fs),
+                backup.BackupResource.from_efs_file_system(ssl_fs),
+            ],
+        )
+
+        # ---- Nag suppressions ------------------------------------------------
+        # AwsSolutions-IAM4: CDK auto-creates an IAM service role for the
+        # BackupSelection and attaches AWSBackupServiceRolePolicyForBackup.
+        # This AWS-managed policy is the prescribed mechanism for granting AWS
+        # Backup the permissions it needs; there is no narrower customer-managed
+        # replacement that covers all required Backup API actions.
+        NagSuppressions.add_resource_suppressions(
+            plan,
+            [
+                {
+                    "id": "AwsSolutions-IAM4",
+                    "reason": (
+                        "AWSBackupServiceRolePolicyForBackup is the AWS-prescribed "
+                        "managed policy for Backup service roles. No customer-managed "
+                        "policy covers the full set of required Backup permissions."
+                    ),
+                    "applies_to": [
+                        "Policy::arn:<AWS::Partition>:iam::aws:policy/"
+                        "service-role/AWSBackupServiceRolePolicyForBackup"
+                    ],
+                }
+            ],
+            apply_to_children=True,
+        )
+
+        self.backup_plan = plan
+        return plan
 
     # ------------------------------------------------------------------ #
     # 3. Fargate service                                                   #

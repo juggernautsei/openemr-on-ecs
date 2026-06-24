@@ -122,8 +122,8 @@ class TenantStack(Stack):
         # Sprint 4.12 — EFS file systems (COMPLETE)
         sites_fs, ssl_fs = _resources.create_efs(vpc, platform_kms_key, tenant_id)
 
-        # Sprint 4.13 — 7-year backup plan (TODO)
-        # _resources.create_backup_plan(sites_fs, ssl_fs, tenant_id)
+        # Sprint 4.13 — 7-year backup plan (COMPLETE)
+        _resources.create_backup_plan(sites_fs, ssl_fs, tenant_id, platform_kms_key)
         #
         # Sprint 4.14 — Fargate service (TODO)
         # service, tg = _resources.create_fargate_service(
