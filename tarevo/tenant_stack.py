@@ -35,6 +35,7 @@ Usage (scripts/provision_tenant.py):
 
 from aws_cdk import Fn, Stack
 from aws_cdk import aws_ec2 as ec2
+from aws_cdk import aws_ecs as ecs
 from aws_cdk import aws_kms as kms
 from aws_cdk import aws_ssm as ssm
 from constructs import Construct
@@ -49,11 +50,13 @@ from .constants import (
     SSM_AURORA_SG_ID,
     SSM_CLUSTER_ARN,
     SSM_CLUSTER_NAME,
+    SSM_CONTAINER_SG_ID,
     SSM_HTTPS_LISTENER_ARN,
     SSM_KMS_KEY_ARN,
     SSM_PRIVATE_SUBNETS,
     SSM_PROVISIONER_FN_ARN,
     SSM_VALKEY_ENDPOINT,
+    SSM_VALKEY_SG_ID,
     SSM_VPC_ID,
 )
 
@@ -80,20 +83,23 @@ class TenantStack(Stack):
         #
         # These are CDK Tokens: '{{resolve:ssm:/tarevo/shared/...}}' resolved by
         # CloudFormation at deploy time — NOT available as Python values at synth time.
-        _vpc_id          = ssm.StringParameter.value_for_string_parameter(self, SSM_VPC_ID)
-        _private_subnets = ssm.StringParameter.value_for_string_parameter(self, SSM_PRIVATE_SUBNETS)
-        _kms_key_arn     = ssm.StringParameter.value_for_string_parameter(self, SSM_KMS_KEY_ARN)
+        _vpc_id             = ssm.StringParameter.value_for_string_parameter(self, SSM_VPC_ID)
+        _private_subnets    = ssm.StringParameter.value_for_string_parameter(self, SSM_PRIVATE_SUBNETS)
+        _kms_key_arn        = ssm.StringParameter.value_for_string_parameter(self, SSM_KMS_KEY_ARN)
+        # Sprint 4.14 — Fargate service SSM imports (ACTIVATED):
+        _cluster_arn        = ssm.StringParameter.value_for_string_parameter(self, SSM_CLUSTER_ARN)
+        _cluster_name       = ssm.StringParameter.value_for_string_parameter(self, SSM_CLUSTER_NAME)
+        _aurora_endpoint    = ssm.StringParameter.value_for_string_parameter(self, SSM_AURORA_ENDPOINT)
+        _aurora_secret_arn  = ssm.StringParameter.value_for_string_parameter(self, SSM_AURORA_SECRET_ARN)
+        _aurora_sg_id       = ssm.StringParameter.value_for_string_parameter(self, SSM_AURORA_SG_ID)
+        _valkey_endpoint    = ssm.StringParameter.value_for_string_parameter(self, SSM_VALKEY_ENDPOINT)
+        _valkey_sg_id       = ssm.StringParameter.value_for_string_parameter(self, SSM_VALKEY_SG_ID)
+        _container_sg_id    = ssm.StringParameter.value_for_string_parameter(self, SSM_CONTAINER_SG_ID)
         # Remaining SSM imports (activated as each sprint lands):
-        #   _cluster_arn        = ssm.StringParameter.value_for_string_parameter(self, SSM_CLUSTER_ARN)
-        #   _cluster_name       = ssm.StringParameter.value_for_string_parameter(self, SSM_CLUSTER_NAME)
         #   _alb_arn            = ssm.StringParameter.value_for_string_parameter(self, SSM_ALB_ARN)
         #   _alb_hz_id          = ssm.StringParameter.value_for_string_parameter(self, SSM_ALB_HOSTED_ZONE)
         #   _alb_sg_id          = ssm.StringParameter.value_for_string_parameter(self, SSM_ALB_SG_ID)
         #   _https_listener_arn = ssm.StringParameter.value_for_string_parameter(self, SSM_HTTPS_LISTENER_ARN)
-        #   _aurora_endpoint    = ssm.StringParameter.value_for_string_parameter(self, SSM_AURORA_ENDPOINT)
-        #   _aurora_secret_arn  = ssm.StringParameter.value_for_string_parameter(self, SSM_AURORA_SECRET_ARN)
-        #   _aurora_sg_id       = ssm.StringParameter.value_for_string_parameter(self, SSM_AURORA_SG_ID)
-        #   _valkey_endpoint    = ssm.StringParameter.value_for_string_parameter(self, SSM_VALKEY_ENDPOINT)
         #   _provisioner_fn_arn = ssm.StringParameter.value_for_string_parameter(self, SSM_PROVISIONER_FN_ARN)
 
         # ── Reconstruct shared objects from SSM Tokens ──────────────────────────
@@ -116,6 +122,36 @@ class TenantStack(Stack):
         # a CloudFormation Fn::Sub/Ref expression in the generated template.
         platform_kms_key = kms.Key.from_key_arn(self, "PlatformKey", _kms_key_arn)
 
+        # ── Reconstruct Sprint-4.14 shared objects from SSM Tokens ─────────────
+        #
+        # ECS cluster: from_cluster_attributes reconstructs a usable ICluster
+        # from the ARN + name Tokens.  has_ec2_capacity=False marks Fargate-only.
+        cluster = ecs.Cluster.from_cluster_attributes(
+            self, "SharedCluster",
+            cluster_arn=_cluster_arn,
+            cluster_name=_cluster_name,
+            vpc=vpc,
+            has_ec2_capacity=False,
+            security_groups=[],
+        )
+
+        # Security groups imported as mutable/immutable references.
+        # mutable=True  → CDK creates AWS::EC2::SecurityGroupIngress resources
+        #                  in THIS stack, enabling cross-stack SG rule additions.
+        # mutable=False → read-only peer reference only; no rule modifications.
+        container_sg = ec2.SecurityGroup.from_security_group_id(
+            self, "ContainerSg", _container_sg_id,
+            mutable=False,   # only used as a peer source; no rules added to it
+        )
+        aurora_sg = ec2.SecurityGroup.from_security_group_id(
+            self, "AuroraSg", _aurora_sg_id,
+            mutable=True,    # create_fargate_service adds MySQL (3306) ingress
+        )
+        valkey_sg = ec2.SecurityGroup.from_security_group_id(
+            self, "ValkeySg", _valkey_sg_id,
+            mutable=True,    # create_fargate_service adds Valkey (6379) ingress
+        )
+
         # ── Build sequence — TenantStack (Sprints 4.12–16) ─────────────────────
         _resources = TenantResourcesComponents(self, tenant_id)
 
@@ -125,12 +161,21 @@ class TenantStack(Stack):
         # Sprint 4.13 — 7-year backup plan (COMPLETE)
         _resources.create_backup_plan(sites_fs, ssl_fs, tenant_id, platform_kms_key)
         #
-        # Sprint 4.14 — Fargate service (TODO)
-        # service, tg = _resources.create_fargate_service(
-        #     cluster, task_role, exec_role, tenant_id,
-        #     _aurora_secret_arn, _valkey_endpoint,
-        #     sites_fs, ssl_fs, container_sg,
-        # )
+        # Sprint 4.14 — Fargate service (COMPLETE)
+        service, tg = _resources.create_fargate_service(
+            vpc=vpc,
+            cluster=cluster,
+            tenant_id=tenant_id,
+            kms_key=platform_kms_key,
+            aurora_secret_arn=_aurora_secret_arn,
+            aurora_endpoint=_aurora_endpoint,
+            valkey_endpoint=_valkey_endpoint,
+            sites_fs=sites_fs,
+            ssl_fs=ssl_fs,
+            container_sg=container_sg,
+            aurora_sg=aurora_sg,
+            valkey_sg=valkey_sg,
+        )
         #
         # Sprint 4.15 — Listener rule + DNS (TODO)
         # _resources.add_listener_rule(listener, tg, tenant_id, listener_priority)
