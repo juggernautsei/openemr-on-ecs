@@ -291,6 +291,11 @@ class NetworkComponents:
             description="Valkey cluster - Redis ingress from ECS task SGs only",
             allow_all_outbound=False,
         )
+        # RETAIN matches the Valkey cache policy: ValkeyCluster is RETAIN-ed via
+        # cfn_options.deletion_policy=RETAIN, so the SG it uses must also be
+        # RETAIN-ed to prevent ROLLBACK_FAILED when CloudFormation tries to delete
+        # the SG while the serverless cache still holds a reference to it.
+        valkey_sg.apply_removal_policy(RemovalPolicy.RETAIN)
 
         # ---- Container SG ---------------------------------------------------
         # Baseline task SG.  Accepts HTTPS from the ALB; tenants inherit this

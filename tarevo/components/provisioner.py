@@ -169,10 +169,10 @@ class ProvisionerComponents:
             timeout=Duration.minutes(5),
             # Lambda max is 15 min; 5 min gives generous headroom for DB + SM
             # operations while keeping CloudFormation wait times reasonable.
-            reserved_concurrent_executions=5,
-            # 5 concurrent provisioner runs is more than enough in practice.
-            # This satisfies HIPAA.Security-LambdaConcurrency and prevents
-            # runaway CloudFormation recursion from consuming Lambda quota.
+            # NOTE: reserved_concurrent_executions is intentionally omitted.
+            # This account has only 10 total concurrent executions; setting any
+            # reserved value drops unreserved below the AWS minimum of 10.
+            # Re-enable once a concurrency limit increase is granted.
         )
 
         # ---- IAM grants ------------------------------------------------------
@@ -242,8 +242,18 @@ class ProvisionerComponents:
                         "synchronously.  Dead-letter queues only apply to async "
                         "Lambda invocations; this function is never invoked "
                         "asynchronously, so a DLQ would never receive messages. "
-                        "Failures are handled by CloudFormation’s own retry and "
+                        "Failures are handled by CloudFormation's own retry and "
                         "rollback mechanisms."
+                    ),
+                },
+                {
+                    "id": "HIPAA.Security-LambdaConcurrency",
+                    "reason": (
+                        "reserved_concurrent_executions is intentionally omitted. "
+                        "This AWS account has a total concurrency limit of 10; "
+                        "setting any reserved value drops unreserved below the "
+                        "minimum of 10 and causes Lambda deployment to fail. "
+                        "Request a concurrency limit increase before production."
                     ),
                 },
             ],

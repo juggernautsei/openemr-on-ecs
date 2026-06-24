@@ -103,6 +103,11 @@ class DatabaseComponents:
             "AuroraParamGroup",
             engine=engine,
             description="Tarevo shared Aurora MySQL - secure transport + query logging",
+            # RETAIN matches the Aurora cluster policy: the cluster is RETAIN-ed
+            # so the param group it references must also be RETAIN-ed, otherwise
+            # CloudFormation tries to delete the param group while the cluster
+            # still uses it, causing ROLLBACK_FAILED on stack cleanup.
+            removal_policy=RemovalPolicy.RETAIN,
             parameters={
                 "require_secure_transport": "ON",
                 "slow_query_log":           "1",
