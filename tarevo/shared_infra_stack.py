@@ -24,7 +24,7 @@ Resources created (in this order once components are implemented):
 
 from typing import Optional
 
-from aws_cdk import Stack
+from aws_cdk import Duration, RemovalPolicy, Stack
 from aws_cdk import aws_certificatemanager as acm
 from aws_cdk import aws_dynamodb as dynamodb
 from aws_cdk import aws_ec2 as ec2
@@ -42,6 +42,7 @@ from .components.database import DatabaseComponents
 from .components.network import NetworkComponents
 from .components.provisioner import ProvisionerComponents
 from .components.security import SecurityComponents
+from .constants import DOMAIN
 
 
 class SharedInfraStack(Stack):
@@ -90,10 +91,10 @@ class SharedInfraStack(Stack):
 
         # === Build sequence — uncomment each line as its Sprint 4.x task lands ===
         #
-        # Sprint 4.1 — Security
-        # self.zone        = route53.HostedZone.from_lookup(self, "Zone", domain_name=DOMAIN)
-        # self.kms_key     = _security.create_kms_key()
-        # self.certificate = _security.create_certificate(self.zone)
+        # Sprint 4.1 — Security (COMPLETE)
+        self.zone        = route53.HostedZone.from_lookup(self, "Zone", domain_name=DOMAIN)
+        self.kms_key     = _security.create_kms_key()
+        self.certificate = _security.create_certificate(self.zone)
         #
         # Sprint 4.2 — Network
         # self.vpc                                          = _network.create_vpc()
