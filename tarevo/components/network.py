@@ -5,7 +5,8 @@ Owns all L3/L4 network resources that are shared across every tenant.
 
 from typing import Optional
 
-from aws_cdk import RemovalPolicy
+from aws_cdk import RemovalPolicy, Stack
+from aws_cdk import aws_certificatemanager as acm
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_elasticloadbalancingv2 as elb
 from aws_cdk import aws_iam as iam
@@ -281,56 +282,236 @@ class NetworkComponents:
 
         return alb_sg, aurora_sg, valkey_sg, container_sg
 
-    # ── ALB ───────────────────────────────────────────────────────────────────
+    # ── ALB ────────────────────────────────────────────────────────────────────
 
-    def create_alb(self, vpc: ec2.Vpc, alb_sg: ec2.SecurityGroup) -> elb.ApplicationLoadBalancer:
-        """Create internet-facing Application Load Balancer with access logs.
+    def create_alb(
+        self,
+        vpc: ec2.Vpc,
+        alb_sg: ec2.SecurityGroup,
+    ) -> elb.ApplicationLoadBalancer:
+        """Create internet-facing ALB with S3 access logs and deletion protection.
+
+        Access log bucket:
+            ALB requires an S3 bucket with an ALB-managed bucket policy.
+            ALB does NOT support KMS-CMK encrypted buckets for access logs
+            (AWS constraint) — SSE-S3 (AES-256) is used instead.  Nag
+            findings about KMS default encryption are suppressed with this
+            justification.
+
+        Deletion protection:
+            Enabled (HIPAA).  To destroy the stack during sprint testing,
+            disable via the AWS Console or CLI before running cdk destroy:
+                aws elbv2 modify-load-balancer-attributes \\
+                    --load-balancer-arn <arn> \\
+                    --attributes Key=deletion_protection.enabled,Value=false
 
         Returns:
-            The created ALB.
-
-        TODO Sprint 4.2:
-            - Create SSE-S3 log bucket (ALB does not support KMS-encrypted buckets)
-            - drop_invalid_header_fields=True
-            - deletion_protection=True (HIPAA)
-            - log_access_logs(log_bucket)
-            - Suppress ELB2 (logs enabled), S3 encryption/replication for log bucket
+            The created ApplicationLoadBalancer.
         """
-        raise NotImplementedError("TODO Sprint 4.2: implement create_alb()")
+        # ---- S3 access-log bucket (SSE-S3 only — ALB cannot write to KMS buckets)
+        log_bucket = s3.Bucket(
+            self.scope,
+            "AlbLogBucket",
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            enforce_ssl=True,
+            versioned=False,
+            encryption=s3.BucketEncryption.S3_MANAGED,
+        )
+
+        NagSuppressions.add_resource_suppressions(
+            log_bucket,
+            [
+                {
+                    "id": "AwsSolutions-S1",
+                    "reason": "ALB access-log bucket — self-referential server access logging is not required.",
+                },
+                {
+                    "id": "HIPAA.Security-S3BucketLoggingEnabled",
+                    "reason": "ALB access-log bucket — self-referential access logging not needed.",
+                },
+                {
+                    "id": "HIPAA.Security-S3BucketReplicationEnabled",
+                    "reason": "ALB access-log bucket — cross-region replication not required for sprint.",
+                },
+                {
+                    "id": "HIPAA.Security-S3BucketVersioningEnabled",
+                    "reason": "ALB access-log bucket — versioning not required for access logs.",
+                },
+                {
+                    "id": "HIPAA.Security-S3DefaultEncryptionKMS",
+                    "reason": (
+                        "ALB access logs cannot be written to KMS-encrypted S3 buckets — "
+                        "this is an AWS ALB service constraint.  SSE-S3 is used instead."
+                    ),
+                },
+            ],
+        )
+
+        # ---- Application Load Balancer ----------------------------------------
+        alb = elb.ApplicationLoadBalancer(
+            self.scope,
+            "SharedAlb",
+            vpc=vpc,
+            internet_facing=True,
+            security_group=alb_sg,
+            drop_invalid_header_fields=True,
+            deletion_protection=True,
+        )
+        alb.log_access_logs(log_bucket, prefix="alb")
+
+        NagSuppressions.add_resource_suppressions(
+            alb,
+            [
+                {
+                    "id": "AwsSolutions-ELB2",
+                    "reason": "ALB access logs are enabled via log_access_logs().",
+                },
+            ],
+        )
+
+        self.alb        = alb
+        self.log_bucket = log_bucket
+        return alb
 
     def add_https_listener(
         self,
         alb: elb.ApplicationLoadBalancer,
-        certificate: "acm.ICertificate",  # noqa: F821 — forward ref
+        certificate: acm.ICertificate,
     ) -> elb.ApplicationListener:
-        """Attach HTTPS/443 listener with default 404 fixed-response.
+        """Attach HTTPS/443 listener to the ALB with a default 404 fixed-response.
+
+        The default action returns HTTP 404 when no tenant listener rule matches
+        the request's Host header.  Each TenantStack adds a host-header rule
+        that forwards its subdomain to its own target group.
+
+        SSL policy:
+            RECOMMENDED_TLS — TLS 1.2+ only; disables older cipher suites.
+
+        open=False:
+            SG ingress on port 443 was already added by create_security_groups().
+            Setting open=False prevents CDK from auto-adding a duplicate rule.
 
         Returns:
-            The created listener (stored as self.https_listener).
-
-        TODO Sprint 4.2:
-            - ssl_policy=SslPolicy.RECOMMENDED_TLS
-            - default_action=ListenerAction.fixed_response(404, ...)
-            - open=False (SG ingress already configured)
+            The created ApplicationListener.
         """
-        raise NotImplementedError("TODO Sprint 4.2: implement add_https_listener()")
+        listener = alb.add_listener(
+            "HttpsListener",
+            port=443,
+            ssl_policy=elb.SslPolicy.RECOMMENDED_TLS,
+            certificates=[certificate],
+            default_action=elb.ListenerAction.fixed_response(
+                status_code=404,
+                content_type="text/plain",
+                message_body="No tenant matched this hostname.",
+            ),
+            open=False,
+        )
+
+        self.https_listener = listener
+        return listener
 
     # ── WAF ───────────────────────────────────────────────────────────────────
 
-    def create_waf(self, alb: elb.ApplicationLoadBalancer) -> wafv2.CfnWebACL:
-        """Create AWS WAF WebACL and associate it with the shared ALB.
+    def create_waf(
+        self,
+        alb: elb.ApplicationLoadBalancer,
+        kms_key: kms.Key,
+    ) -> wafv2.CfnWebACL:
+        """Create a WAFv2 WebACL with AWS managed rule groups and associate it with the ALB.
 
-        Managed rule groups applied:
-            - AWSManagedRulesCommonRuleSet
-            - AWSManagedRulesKnownBadInputsRuleSet
-            - AWSManagedRulesSQLiRuleSet
+        Managed rule groups (REGIONAL scope):
+            Priority 10 — AWSManagedRulesCommonRuleSet
+                Core OWASP Top 10 protections: XSS, RFI, path traversal.
+            Priority 20 — AWSManagedRulesKnownBadInputsRuleSet
+                Log4Shell, Spring4Shell, SSRF probes, malformed request patterns.
+            Priority 30 — AWSManagedRulesSQLiRuleSet
+                SQL injection protection — critical for the Aurora MySQL backend.
+
+        Logging:
+            All WAF decisions are logged to a CloudWatch Log Group whose name
+            starts with ``aws-waf-logs-`` (AWS requirement for WAF log delivery).
+            The log group is KMS-encrypted with the platform CMK.
+
+        Args:
+            alb:     The shared ALB to protect.
+            kms_key: Platform CMK used to encrypt the WAF log group.
 
         Returns:
-            The created WebACL.
-
-        TODO Sprint 4.3:
-            - scope=REGIONAL, default_action=Allow
-            - Associate via CfnWebACLAssociation with alb.load_balancer_arn
-            - Suppress AwsSolutions-WAF4 (sampled requests enabled for cost)
+            The created CfnWebACL.
         """
-        raise NotImplementedError("TODO Sprint 4.3: implement create_waf()")
+        # ---- WAF log group (name MUST start with 'aws-waf-logs-') ---------------
+        region   = Stack.of(self.scope).region
+        acct     = Stack.of(self.scope).account
+        log_group_name = f"aws-waf-logs-tarevo-{acct}-{region}"
+
+        waf_log_group = logs.LogGroup(
+            self.scope,
+            "WafLogGroup",
+            log_group_name=log_group_name,
+            encryption_key=kms_key,
+            retention=logs.RetentionDays.ONE_YEAR,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        # ---- WebACL -------------------------------------------------------------
+        web_acl = wafv2.CfnWebACL(
+            self.scope,
+            "WebAcl",
+            scope="REGIONAL",
+            default_action=wafv2.CfnWebACL.DefaultActionProperty(allow={}),
+            visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                cloud_watch_metrics_enabled=True,
+                metric_name="TarevoWebAcl",
+                sampled_requests_enabled=True,
+            ),
+            rules=[
+                _managed_rule("AWSManagedRulesCommonRuleSet",         priority=10),
+                _managed_rule("AWSManagedRulesKnownBadInputsRuleSet", priority=20),
+                _managed_rule("AWSManagedRulesSQLiRuleSet",           priority=30),
+            ],
+        )
+
+        # ---- Associate WebACL with the ALB -------------------------------------
+        wafv2.CfnWebACLAssociation(
+            self.scope,
+            "WebAclAssociation",
+            resource_arn=alb.load_balancer_arn,
+            web_acl_arn=web_acl.attr_arn,
+        )
+
+        # ---- Enable WAF logging to CloudWatch -----------------------------------
+        wafv2.CfnLoggingConfiguration(
+            self.scope,
+            "WafLogging",
+            log_destination_configs=[waf_log_group.log_group_arn],
+            resource_arn=web_acl.attr_arn,
+        )
+
+        self.waf_acl = web_acl
+        return web_acl
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+def _managed_rule(name: str, priority: int) -> wafv2.CfnWebACL.RuleProperty:
+    """Build a WAFv2 RuleProperty for an AWS managed rule group."""
+    return wafv2.CfnWebACL.RuleProperty(
+        name=name,
+        priority=priority,
+        override_action=wafv2.CfnWebACL.OverrideActionProperty(none={}),
+        visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+            cloud_watch_metrics_enabled=True,
+            metric_name=name,
+            sampled_requests_enabled=True,
+        ),
+        statement=wafv2.CfnWebACL.StatementProperty(
+            managed_rule_group_statement=wafv2.CfnWebACL.ManagedRuleGroupStatementProperty(
+                name=name,
+                vendor_name="AWS",
+            )
+        ),
+    )

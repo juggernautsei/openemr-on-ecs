@@ -105,12 +105,12 @@ class SharedInfraStack(Stack):
             self.container_sg,
         ) = _network.create_security_groups(self.vpc)
         #
-        # Sprint 4.3 — ALB + WAF (next sub-task)
-        # self.alb            = _network.create_alb(self.vpc, self.alb_sg)
-        # self.https_listener = _network.add_https_listener(self.alb, self.certificate)
-        # _network.create_waf(self.alb)
+        # Sprint 4.3 — ALB + WAF (COMPLETE)
+        self.alb            = _network.create_alb(self.vpc, self.alb_sg)
+        self.https_listener = _network.add_https_listener(self.alb, self.certificate)
+        _network.create_waf(self.alb, self.kms_key)
         #
-        # Sprint 4.3 — Database
+        # Sprint 4.4 — Database
         # self.aurora_cluster, self.aurora_admin_secret = _database.create_aurora(
         #     self.vpc, self.aurora_sg, self.kms_key
         # )
