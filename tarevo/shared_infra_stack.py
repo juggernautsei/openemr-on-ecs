@@ -114,11 +114,14 @@ class SharedInfraStack(Stack):
         self.aurora_cluster, self.aurora_admin_secret = _database.create_aurora(
             self.vpc, self.aurora_sg, self.kms_key
         )
-        # self.valkey_cluster = _database.create_valkey(self.vpc, self.valkey_sg, self.kms_key)
-        # self.tenant_table   = _database.create_tenant_registry(self.kms_key)
+        # Sprint 4.5 — Valkey Serverless
+        self.valkey_cluster = _database.create_valkey(self.vpc, self.valkey_sg, self.kms_key)
         #
-        # Sprint 4.4 — Compute
-        # self.cluster = _compute.create_cluster(self.vpc)
+        # Sprint 4.6 — DynamoDB tenant registry
+        self.tenant_table = _database.create_tenant_registry(self.kms_key)
+        #
+        # Sprint 4.7 — ECS Cluster
+        self.cluster = _compute.create_cluster(self.vpc, self.kms_key)
         #
         # Sprint 4.7 — Provisioner Lambda
         # self.provisioner_fn = _provisioner.create_lambda(
