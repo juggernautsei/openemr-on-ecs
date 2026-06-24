@@ -35,6 +35,7 @@ SSM_KMS_KEY_ARN         = f"{SSM_PREFIX}/kms-key-arn"
 SSM_PROVISIONER_FN_ARN  = f"{SSM_PREFIX}/tenant-provisioner-fn-arn"
 SSM_TENANT_TABLE_NAME   = f"{SSM_PREFIX}/tenant-table-name"
 SSM_ECR_REPO_URI        = f"{SSM_PREFIX}/ecr-repo-uri"
+SSM_CONTAINER_SG_ID     = f"{SSM_PREFIX}/container-sg-id"
 
 # ── Network ───────────────────────────────────────────────────────────────────
 VPC_CIDR = "10.2.0.0/16"

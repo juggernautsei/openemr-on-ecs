@@ -25,6 +25,7 @@ from ..constants import (
     SSM_ALB_HOSTED_ZONE,
     SSM_ALB_SG_ID,
     SSM_AURORA_SG_ID,
+    SSM_CONTAINER_SG_ID,
     SSM_HTTPS_LISTENER_ARN,
     SSM_PRIVATE_SUBNETS,
     SSM_VALKEY_SG_ID,
@@ -328,6 +329,13 @@ class NetworkComponents:
             parameter_name=SSM_VALKEY_SG_ID,
             string_value=valkey_sg.security_group_id,
             description="Valkey cluster security group ID",
+        )
+        ssm.StringParameter(
+            self.scope,
+            "ContainerSgIdParam",
+            parameter_name=SSM_CONTAINER_SG_ID,
+            string_value=container_sg.security_group_id,
+            description="ECS container task SG ID — used by TenantStack for EFS NFS access rules",
         )
 
         self.alb_sg    = alb_sg
