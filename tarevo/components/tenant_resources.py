@@ -24,6 +24,7 @@ from aws_cdk import aws_iam as iam
 from aws_cdk import aws_kms as kms
 from aws_cdk import aws_logs as logs
 from aws_cdk import aws_route53 as route53
+from aws_cdk import aws_route53_targets as route53_targets
 from aws_cdk import aws_secretsmanager as secretsmanager
 from cdk_nag import NagSuppressions
 from constructs import Construct
@@ -682,45 +683,70 @@ class TenantResourcesComponents:
         return service, target_group
 
     # ------------------------------------------------------------------ #
-    # 4. ALB listener rule                                                 #
+    # 4. ALB listener rule (Sprint 4.15 — COMPLETE)                       #
     # ------------------------------------------------------------------ #
     def add_listener_rule(
         self,
-        listener: elbv2.ApplicationListener,
+        listener: elbv2.IApplicationListener,
         target_group: elbv2.ApplicationTargetGroup,
         tenant_id: str,
         priority: int,
     ) -> elbv2.ApplicationListenerRule:
-        """Add an HTTPS listener rule routing {tenant_id}.{DOMAIN} to the tenant service.
+        """Add an HTTPS listener rule routing {tenant_id}.{DOMAIN} to this tenant's service.
 
-        Host header condition: f"{tenant_id}.{DOMAIN}"
-        Priority must be unique across all tenants.
+        Host-header condition matches exactly one subdomain per tenant so
+        requests for ``{tenant_id}.tarevoehr.app`` are forwarded to the
+        tenant's Fargate target group.
+
+        Priority must be unique across all tenants sharing the HTTPS listener.
+        The caller (``provision_tenant.py``) is responsible for allocating
+        a unique integer; the shared ALB supports up to 100 rules by default
+        (request a quota increase before exceeding ~90 tenants).
 
         Returns:
             ApplicationListenerRule
-
-        TODO Sprint 4.11:
-            - conditions=[ListenerCondition.host_headers([f"{tenant_id}.{DOMAIN}"])]
-            - action=ListenerAction.forward([target_group])
         """
-        raise NotImplementedError("TODO Sprint 4.11: implement add_listener_rule()")
+        rule = elbv2.ApplicationListenerRule(
+            self.scope,
+            f"{tenant_id.capitalize()}ListenerRule",
+            listener=listener,
+            priority=priority,
+            conditions=[
+                elbv2.ListenerCondition.host_headers(
+                    [f"{tenant_id}.{DOMAIN}"]
+                )
+            ],
+            action=elbv2.ListenerAction.forward([target_group]),
+        )
+        self.listener_rule = rule
+        return rule
 
     # ------------------------------------------------------------------ #
-    # 5. Route 53 DNS                                                      #
+    # 5. Route 53 DNS (Sprint 4.15 — COMPLETE)                            #
     # ------------------------------------------------------------------ #
     def create_dns_record(
         self,
         hosted_zone: route53.IHostedZone,
-        alb: elbv2.ApplicationLoadBalancer,
+        alb: elbv2.IApplicationLoadBalancer,
         tenant_id: str,
     ) -> route53.ARecord:
         """Create an A alias record pointing {tenant_id}.{DOMAIN} to the shared ALB.
 
+        Uses an alias target so there is no TTL to manage and no additional
+        Route53 charges for the alias lookup.  The alias automatically follows
+        the ALB's IP addresses during maintenance windows.
+
         Returns:
             ARecord
-
-        TODO Sprint 4.12:
-            - record_name=f"{tenant_id}.{DOMAIN}"
-            - target=RecordTarget.from_alias(LoadBalancerTarget(alb))
         """
-        raise NotImplementedError("TODO Sprint 4.12: implement create_dns_record()")
+        record = route53.ARecord(
+            self.scope,
+            f"{tenant_id.capitalize()}DnsRecord",
+            zone=hosted_zone,
+            record_name=f"{tenant_id}.{DOMAIN}",
+            target=route53.RecordTarget.from_alias(
+                route53_targets.LoadBalancerTarget(alb)
+            ),
+        )
+        self.dns_record = record
+        return record
