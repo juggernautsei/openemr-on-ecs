@@ -33,16 +33,21 @@ Usage (scripts/provision_tenant.py):
                 env=env)
 """
 
-from aws_cdk import Fn, Stack
+from aws_cdk import CustomResource, Fn, RemovalPolicy, Stack
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_ecs as ecs
+from aws_cdk import aws_elasticloadbalancingv2 as elbv2
 from aws_cdk import aws_kms as kms
+from aws_cdk import aws_lambda as _lambda
+from aws_cdk import aws_route53 as route53
 from aws_cdk import aws_ssm as ssm
 from constructs import Construct
 
 from .components.tenant_resources import TenantResourcesComponents
 from .constants import (
+    DOMAIN,
     SSM_ALB_ARN,
+    SSM_ALB_DNS,
     SSM_ALB_HOSTED_ZONE,
     SSM_ALB_SG_ID,
     SSM_AURORA_ENDPOINT,
@@ -95,12 +100,13 @@ class TenantStack(Stack):
         _valkey_endpoint    = ssm.StringParameter.value_for_string_parameter(self, SSM_VALKEY_ENDPOINT)
         _valkey_sg_id       = ssm.StringParameter.value_for_string_parameter(self, SSM_VALKEY_SG_ID)
         _container_sg_id    = ssm.StringParameter.value_for_string_parameter(self, SSM_CONTAINER_SG_ID)
-        # Remaining SSM imports (activated as each sprint lands):
-        #   _alb_arn            = ssm.StringParameter.value_for_string_parameter(self, SSM_ALB_ARN)
-        #   _alb_hz_id          = ssm.StringParameter.value_for_string_parameter(self, SSM_ALB_HOSTED_ZONE)
-        #   _alb_sg_id          = ssm.StringParameter.value_for_string_parameter(self, SSM_ALB_SG_ID)
-        #   _https_listener_arn = ssm.StringParameter.value_for_string_parameter(self, SSM_HTTPS_LISTENER_ARN)
-        #   _provisioner_fn_arn = ssm.StringParameter.value_for_string_parameter(self, SSM_PROVISIONER_FN_ARN)
+        # Sprint 4.15 + 4.16 SSM imports (ACTIVATED):
+        _alb_arn            = ssm.StringParameter.value_for_string_parameter(self, SSM_ALB_ARN)
+        _alb_dns            = ssm.StringParameter.value_for_string_parameter(self, SSM_ALB_DNS)
+        _alb_hz_id          = ssm.StringParameter.value_for_string_parameter(self, SSM_ALB_HOSTED_ZONE)
+        _alb_sg_id          = ssm.StringParameter.value_for_string_parameter(self, SSM_ALB_SG_ID)
+        _https_listener_arn = ssm.StringParameter.value_for_string_parameter(self, SSM_HTTPS_LISTENER_ARN)
+        _provisioner_fn_arn = ssm.StringParameter.value_for_string_parameter(self, SSM_PROVISIONER_FN_ARN)
 
         # ── Reconstruct shared objects from SSM Tokens ──────────────────────────
         #
@@ -122,7 +128,35 @@ class TenantStack(Stack):
         # a CloudFormation Fn::Sub/Ref expression in the generated template.
         platform_kms_key = kms.Key.from_key_arn(self, "PlatformKey", _kms_key_arn)
 
-        # ── Reconstruct Sprint-4.14 shared objects from SSM Tokens ─────────────
+        # ── Reconstruct Sprint 4.15 shared objects from SSM Tokens ─────────────
+        #
+        # ALB: reconstructed from ARN + DNS name + canonical hosted-zone ID so
+        # route53_targets.LoadBalancerTarget can create an alias record without
+        # a cross-stack CloudFormation export dependency.
+        alb = elbv2.ApplicationLoadBalancer.from_load_balancer_attributes(
+            self, "SharedAlb",
+            load_balancer_arn=_alb_arn,
+            load_balancer_dns_name=_alb_dns,
+            load_balancer_canonical_hosted_zone_id=_alb_hz_id,
+        )
+
+        # HTTPS listener: imported from ARN + ALB SG.  The ALB SG is required
+        # by from_application_listener_attributes; mutable=False means CDK will
+        # not add any egress rule to the shared ALB SG from this stack.
+        _alb_sg = ec2.SecurityGroup.from_security_group_id(
+            self, "AlbSg", _alb_sg_id, mutable=False
+        )
+        listener = elbv2.ApplicationListener.from_application_listener_attributes(
+            self, "HttpsListener",
+            listener_arn=_https_listener_arn,
+            security_group=_alb_sg,
+        )
+
+        # Route53 hosted zone: from_lookup uses the cached cdk.context.json value
+        # populated when SharedInfraStack ran from_lookup; no live API call needed.
+        zone = route53.HostedZone.from_lookup(self, "Zone", domain_name=DOMAIN)
+
+        # ── Reconstruct Sprint 4.14 shared objects from SSM Tokens ─────────────
         #
         # ECS cluster: from_cluster_attributes reconstructs a usable ICluster
         # from the ARN + name Tokens.  has_ec2_capacity=False marks Fargate-only.
@@ -177,8 +211,31 @@ class TenantStack(Stack):
             valkey_sg=valkey_sg,
         )
         #
-        # Sprint 4.15 — Listener rule + DNS (TODO)
-        # _resources.add_listener_rule(listener, tg, tenant_id, listener_priority)
-        # _resources.create_dns_record(zone, alb, tenant_id)
+        # Sprint 4.15 — Listener rule + DNS (COMPLETE)
+        _resources.add_listener_rule(listener, tg, tenant_id, listener_priority)
+        _resources.create_dns_record(zone, alb, tenant_id)
+
+        # Sprint 4.16 — DB provisioner Custom Resource (COMPLETE)
+        # CloudFormation invokes the provisioner Lambda on CREATE (provision
+        # tenant DB + Secrets Manager credentials) and on DELETE (drop DB + user).
         #
-        # Sprint 4.16 — DB provisioner Custom Resource (TODO)
+        # CfnPermission grants cloudformation.amazonaws.com invoke access so
+        # CloudFormation can call the provisioner Lambda without the stack's
+        # IAM principal needing lambda:InvokeFunction on the function ARN.
+        # Each TenantStack adds one statement keyed by tenant_id.
+        _lambda.CfnPermission(
+            self, f"{tenant_id.capitalize()}ProvisionerCfnPerm",
+            action="lambda:InvokeFunction",
+            function_name=_provisioner_fn_arn,
+            principal="cloudformation.amazonaws.com",
+            source_account=self.account,
+        )
+        CustomResource(
+            self, f"{tenant_id.capitalize()}TenantDb",
+            service_token=_provisioner_fn_arn,
+            resource_type="Custom::TenantDatabase",
+            properties={"TenantId": tenant_id},
+            # DESTROY triggers DELETE on cdk destroy, which drops the tenant DB
+            # and user.  Archive the Aurora snapshot before running destroy.
+            removal_policy=RemovalPolicy.DESTROY,
+        )
