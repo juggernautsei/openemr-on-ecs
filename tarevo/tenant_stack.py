@@ -133,11 +133,12 @@ class TenantStack(Stack):
         # ALB: reconstructed from ARN + DNS name + canonical hosted-zone ID so
         # route53_targets.LoadBalancerTarget can create an alias record without
         # a cross-stack CloudFormation export dependency.
-        alb = elbv2.ApplicationLoadBalancer.from_load_balancer_attributes(
+        alb = elbv2.ApplicationLoadBalancer.from_application_load_balancer_attributes(
             self, "SharedAlb",
             load_balancer_arn=_alb_arn,
             load_balancer_dns_name=_alb_dns,
             load_balancer_canonical_hosted_zone_id=_alb_hz_id,
+            security_group_id=_alb_sg_id,
         )
 
         # HTTPS listener: imported from ARN + ALB SG.  The ALB SG is required
