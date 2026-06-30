@@ -184,7 +184,7 @@ jobs:
       - name: Validate CloudFormation template with cfn-lint
         run: |
           pip install cfn-lint
-          cfn-lint cdk.out/*.template.json
+          cfn-lint --non-zero-exit-code error cdk.out/*.template.json
 
   code-quality:
     name: Code Quality Checks
