@@ -30,6 +30,7 @@ Usage (scripts/provision_tenant.py):
     TenantStack(app, f"TarevoTenant-{tenant_id}",
                 tenant_id=tenant_id,
                 listener_priority=listener_priority,
+                tenant_image_uri="123456789012.dkr.ecr.us-east-2.amazonaws.com/tarevo-openemr:tenant-tag",
                 env=env)
 """
 
@@ -80,6 +81,7 @@ class TenantStack(Stack):
         *,
         tenant_id: str,
         listener_priority: int,
+        tenant_image_uri: str | None = None,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -210,6 +212,7 @@ class TenantStack(Stack):
             container_sg=container_sg,
             aurora_sg=aurora_sg,
             valkey_sg=valkey_sg,
+            tenant_image_uri=tenant_image_uri,
         )
         #
         # Sprint 4.15 — Listener rule + DNS (COMPLETE)

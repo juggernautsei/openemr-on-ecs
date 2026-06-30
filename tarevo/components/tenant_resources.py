@@ -47,6 +47,16 @@ def tenant_database_name(tenant_id: str) -> str:
     return f"{tenant_id.replace('-', '_')}_db"
 
 
+def resolve_tenant_image_uri(tenant_image_uri: str | None) -> str:
+    """Return tenant override image URI when provided, otherwise default image."""
+    if tenant_image_uri is None:
+        return ECR_IMAGE_URI
+    image_uri = tenant_image_uri.strip()
+    if not image_uri:
+        raise ValueError("tenant_image_uri must be a non-empty image URI when provided.")
+    return image_uri
+
+
 class TenantResourcesComponents:
     """Creates all per-tenant resources within a TenantStack.
 
@@ -326,6 +336,7 @@ class TenantResourcesComponents:
         container_sg: ec2.ISecurityGroup,
         aurora_sg: ec2.ISecurityGroup,
         valkey_sg: ec2.ISecurityGroup,
+        tenant_image_uri: str | None = None,
     ) -> tuple[ecs.FargateService, elbv2.ApplicationTargetGroup]:
         """Create an ARM64 Fargate service running OpenEMR for this tenant.
 
@@ -335,7 +346,8 @@ class TenantResourcesComponents:
                 write, Secrets Manager read for Aurora credentials).
 
         Container:
-            Image:  ECR_IMAGE_URI constant (Tarevo-branded OpenEMR ARM64).
+            Image:  Uses tenant_image_uri when provided; otherwise ECR_IMAGE_URI
+                constant (Tarevo-branded OpenEMR ARM64).
             Runtime: Linux ARM64 (Graviton) for cost efficiency.
             Port:   CONTAINER_PORT (443) — OpenEMR terminates TLS internally.
             EFS mounts:
@@ -939,7 +951,9 @@ class TenantResourcesComponents:
         # REDIS_TLS=on: ElastiCache Valkey transit encryption is enabled.
         container = task_def.add_container(
             "openemr",
-            image=ecs.ContainerImage.from_registry(ECR_IMAGE_URI),
+            image=ecs.ContainerImage.from_registry(
+                resolve_tenant_image_uri(tenant_image_uri)
+            ),
             container_name="openemr",
             memory_limit_mib=FARGATE_MEMORY,
             working_directory="/var/www/localhost/htdocs/openemr",

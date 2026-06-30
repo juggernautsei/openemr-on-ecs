@@ -5,6 +5,7 @@ Production mode: only SharedInfraStack is instantiated by default.
 Per-tenant stacks are provisioned on-demand by passing CDK context:
 
     cdk deploy TarevoTenant-<tenant> -c tenant_id=<tenant> -c listener_priority=<int>
+    cdk deploy TarevoTenant-<tenant> -c tenant_id=<tenant> -c listener_priority=<int> -c tenant_image_uri=<image>
 
 This avoids bundling per-tenant CloudFormation stacks into the shared
 infra pipeline and lets each tenant be deployed/destroyed independently.
@@ -36,6 +37,7 @@ SharedInfraStack(app, "TarevoSharedInfra", env=env)
 # to shared infra. This enables on-demand tenant provisioning from CLI scripts.
 tenant_id = app.node.try_get_context("tenant_id")
 listener_priority_context = app.node.try_get_context("listener_priority")
+tenant_image_uri_context = app.node.try_get_context("tenant_image_uri")
 
 if tenant_id:
     if listener_priority_context is None:
@@ -49,12 +51,21 @@ if tenant_id:
         raise ValueError(
             "listener_priority must be an integer."
         ) from error
+    tenant_image_uri: str | None = None
+    if tenant_image_uri_context is not None:
+        tenant_image_uri = str(tenant_image_uri_context).strip()
+        if not tenant_image_uri:
+            raise ValueError(
+                "tenant_image_uri must be a non-empty image URI when provided. "
+                "Use -c tenant_image_uri=<account>.dkr.ecr.<region>.amazonaws.com/<repo>:<tag>."
+            )
 
     TenantStack(
         app,
         f"TarevoTenant-{tenant_id}",
         tenant_id=tenant_id,
         listener_priority=listener_priority,
+        tenant_image_uri=tenant_image_uri,
         env=env,
     )
 
