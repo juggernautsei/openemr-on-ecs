@@ -42,6 +42,11 @@ from ..constants import (
 )
 
 
+def tenant_database_name(tenant_id: str) -> str:
+    """Return a MySQL-safe database name for a tenant identifier."""
+    return f"{tenant_id.replace('-', '_')}_db"
+
+
 class TenantResourcesComponents:
     """Creates all per-tenant resources within a TenantStack.
 
@@ -947,7 +952,7 @@ class TenantResourcesComponents:
                 )
             ],
             environment={
-                "MYSQL_DATABASE": f"{tenant_id}_db",
+                "MYSQL_DATABASE": tenant_database_name(tenant_id),
                 "MYSQL_PORT":     str(MYSQL_PORT),
                 "REDIS_SERVER":   valkey_endpoint,
                 "REDIS_PORT":     str(VALKEY_PORT),

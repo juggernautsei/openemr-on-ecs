@@ -18,10 +18,11 @@ Behaviour
 CREATE:
     1. Fetch admin credentials from Secrets Manager.
     2. Connect to Aurora as admin.
-    3. CREATE DATABASE IF NOT EXISTS `{tenant_id}_db`.
+    3. CREATE DATABASE IF NOT EXISTS `{tenant_id_normalized}_db`
+       where hyphens are converted to underscores.
     4. Generate a random 32-char password for the tenant user.
     5. CREATE USER IF NOT EXISTS `{tenant_id}`@`%` IDENTIFIED BY '<password>'.
-    6. GRANT ALL PRIVILEGES ON `{tenant_id}_db`.* TO `{tenant_id}`@`%`.
+    6. GRANT ALL PRIVILEGES ON `{tenant_id_normalized}_db`.* TO `{tenant_id}`@`%`.
     7. FLUSH PRIVILEGES.
     8. Store tenant credentials in Secrets Manager as JSON:
            {"host": ..., "port": ..., "dbname": ..., "username": ..., "password": ...}
@@ -35,7 +36,7 @@ UPDATE:
 DELETE:
     1. Fetch admin credentials from Secrets Manager.
     2. Connect to Aurora as admin.
-    3. DROP DATABASE IF EXISTS `{tenant_id}_db`.
+    3. DROP DATABASE IF EXISTS `{tenant_id_normalized}_db`.
     4. DROP USER IF EXISTS `{tenant_id}`@`%`.
     5. FLUSH PRIVILEGES.
     6. Delete Secrets Manager secret /tarevo/tenants/{tenant_id}/db-credentials.
@@ -62,6 +63,10 @@ _DB_NAME_SUFFIX = "_db"
 _SECRETS_PREFIX = "/tarevo/tenants"
 _PASSWORD_ALPHABET = string.ascii_letters + string.digits + "!#$%^&*-_=+"
 _PASSWORD_LENGTH = 32
+
+def _tenant_database_name(tenant_id: str) -> str:
+    """Return a MySQL-safe database name for a tenant identifier."""
+    return f"{tenant_id.replace('-', '_')}{_DB_NAME_SUFFIX}"
 
 
 def handler(event: dict, context: object) -> None:  # noqa: ANN001
@@ -170,7 +175,7 @@ def _handle_create(tenant_id: str) -> None:
     """Create the tenant database, user, grants, and Secrets Manager secret."""
     admin_user, admin_pass = _get_admin_credentials()
     tenant_password = _generate_password()
-    db_name = f"{tenant_id}{_DB_NAME_SUFFIX}"
+    db_name = _tenant_database_name(tenant_id)
 
     conn = _connect_aurora_with_fallback(admin_user, admin_pass)
     try:
@@ -183,7 +188,8 @@ def _handle_create(tenant_id: str) -> None:
             # create the DB itself puts it into "fresh install" mode.
             #
             # noqa: S608 — tenant_id is validated by the caller (TenantStack constructor)
-            # requires alphanumeric only; no injection risk.
+            # to lowercase alphanumeric + hyphen only; db_name is normalized to
+            # a lowercase alphanumeric + underscore identifier.
             # Note: backtick-quoted host `%%` uses string concat (NOT f-string) so that
             # pymysql sees the literal %% and converts it to % for the host wildcard.
             # In an f-string, Python would collapse %% → % before pymysql runs its own
@@ -278,7 +284,7 @@ def _handle_update(tenant_id: str) -> None:
 def _handle_delete(tenant_id: str) -> None:
     """Drop the tenant database, user, and Secrets Manager secret."""
     admin_user, admin_pass = _get_admin_credentials()
-    db_name = f"{tenant_id}{_DB_NAME_SUFFIX}"
+    db_name = _tenant_database_name(tenant_id)
 
     conn = _connect_aurora_with_fallback(admin_user, admin_pass)
     try:

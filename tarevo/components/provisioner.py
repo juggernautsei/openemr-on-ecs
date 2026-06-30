@@ -7,15 +7,16 @@ tenant_id.  It runs inside the VPC to reach the Aurora private endpoint.
 On CREATE:
     1. Fetch admin credentials from the Aurora admin Secrets Manager secret.
     2. Connect to Aurora as admin via pymysql.
-    3. CREATE DATABASE IF NOT EXISTS `{tenant_id}_db`.
+    3. CREATE DATABASE IF NOT EXISTS `{tenant_id_normalized}_db`
+       where hyphens in tenant_id are converted to underscores.
     4. CREATE USER IF NOT EXISTS `{tenant_id}`@`%` with a generated 32-char password.
-    5. GRANT ALL PRIVILEGES ON `{tenant_id}_db`.* TO `{tenant_id}`@`%`.
+    5. GRANT ALL PRIVILEGES ON `{tenant_id_normalized}_db`.* TO `{tenant_id}`@`%`.
     6. Store per-tenant credentials in Secrets Manager as JSON:
            /tarevo/tenants/{tenant_id}/db-credentials
 
 On DELETE:
     1-2.  Same admin connect.
-    3. DROP DATABASE IF EXISTS `{tenant_id}_db`.
+    3. DROP DATABASE IF EXISTS `{tenant_id_normalized}_db`.
     4. DROP USER IF EXISTS `{tenant_id}`@`%`.
     5. Delete the tenant’s Secrets Manager secret.
 
