@@ -29,13 +29,7 @@ def _load_tenant_db_provisioner_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "cfnresponse", fake_cfnresponse)
     monkeypatch.setitem(sys.modules, "pymysql", fake_pymysql)
 
-    module_path = (
-        Path(__file__).resolve().parents[2]
-        / "tarevo"
-        / "lambda"
-        / "tenant_db_provisioner"
-        / "index.py"
-    )
+    module_path = Path(__file__).resolve().parents[2] / "tarevo" / "lambda" / "tenant_db_provisioner" / "index.py"
     spec = importlib.util.spec_from_file_location("tenant_db_provisioner_index", module_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Unable to load module from {module_path}")

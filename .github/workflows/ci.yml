@@ -149,17 +149,19 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID: "fake"
           AWS_SECRET_ACCESS_KEY: "fake"
-          AWS_DEFAULT_REGION: "us-west-2"
-          CDK_DEFAULT_REGION: "us-west-2"
+          CDK_DEFAULT_ACCOUNT: "600430252128"
+          AWS_DEFAULT_REGION: "us-east-2"
+          CDK_DEFAULT_REGION: "us-east-2"
         run: |
-          cdk synth --no-lookups -c certificate_arn=arn:aws:acm:us-west-2:123456789012:certificate/00000000-0000-0000-0000-000000000000
+          cdk synth --no-lookups -c certificate_arn=arn:aws:acm:us-east-2:600430252128:certificate/00000000-0000-0000-0000-000000000000
 
       - name: Test configuration matrix
         env:
           AWS_ACCESS_KEY_ID: "fake"
           AWS_SECRET_ACCESS_KEY: "fake"
-          AWS_DEFAULT_REGION: "us-west-2"
-          CDK_DEFAULT_REGION: "us-west-2"
+          CDK_DEFAULT_ACCOUNT: "600430252128"
+          AWS_DEFAULT_REGION: "us-east-2"
+          CDK_DEFAULT_REGION: "us-east-2"
         run: |
           echo "Testing multiple configurations to ensure all features work..."
           python3 scripts/test-cdk-synthesis.py
