@@ -144,6 +144,21 @@ jobs:
       - name: Install AWS CDK CLI
         run: |
           npm install --location=global aws-cdk@2
+      - name: Seed CDK context cache for no-lookup CI
+        run: |
+          cat > cdk.context.json <<'JSON'
+          {
+            "availability-zones:account=600430252128:region=us-east-2": [
+              "us-east-2a",
+              "us-east-2b",
+              "us-east-2c"
+            ],
+            "hosted-zone:account=600430252128:domainName=tarevoehr.app:region=us-east-2": {
+              "Id": "/hostedzone/Z04523733LXLATJJ8NU9B",
+              "Name": "tarevoehr.app."
+            }
+          }
+          JSON
 
       - name: Run cdk synth with default config
         env:
