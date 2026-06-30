@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """CDK application entry point.
 
-Production mode: only SharedInfraStack is instantiated here.
-Per-tenant stacks are provisioned on-demand via:
+Production mode: only SharedInfraStack is instantiated by default.
+Per-tenant stacks are provisioned on-demand by passing CDK context:
 
-    python scripts/provision_tenant.py --tenant-id <id> --priority <int>
+    cdk deploy TarevoTenant-<tenant> -c tenant_id=<tenant> -c listener_priority=<int>
 
 This avoids bundling per-tenant CloudFormation stacks into the shared
 infra pipeline and lets each tenant be deployed/destroyed independently.
@@ -31,11 +31,31 @@ env = cdk.Environment(
 # Deploys: KMS key, ACM cert, VPC, ALB, WAF, ECS cluster,
 #          tenant registry, provisioner Lambda, ECR repository.
 SharedInfraStack(app, "TarevoSharedInfra", env=env)
+# ── Dynamic tenant stack (optional) ───────────────────────────────────────────────
+# When tenant context is provided, synth/deploy only that tenant stack in addition
+# to shared infra. This enables on-demand tenant provisioning from CLI scripts.
+tenant_id = app.node.try_get_context("tenant_id")
+listener_priority_context = app.node.try_get_context("listener_priority")
 
-# ── Sprint 5 Phase B staging verification tenants (removed after testing) ─────
-# Note: tenant IDs must not contain hyphens — hyphens are not valid in unquoted
-# MySQL identifiers and will cause OpenEMR’s setup scripts to fail.
-TenantStack(app, "TarevoTenant-testa", tenant_id="testa", listener_priority=100, env=env)
-TenantStack(app, "TarevoTenant-testb", tenant_id="testb", listener_priority=200, env=env)
+if tenant_id:
+    if listener_priority_context is None:
+        raise ValueError(
+            "listener_priority context is required when tenant_id is provided. "
+            "Use -c listener_priority=<int>."
+        )
+    try:
+        listener_priority = int(listener_priority_context)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "listener_priority must be an integer."
+        ) from error
+
+    TenantStack(
+        app,
+        f"TarevoTenant-{tenant_id}",
+        tenant_id=tenant_id,
+        listener_priority=listener_priority,
+        env=env,
+    )
 
 app.synth()
