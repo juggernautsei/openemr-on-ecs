@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CDK application entry point — Sprint 4 production branch: sprint/4-shared-infra-refactor.
+"""CDK application entry point.
 
 Production mode: only SharedInfraStack is instantiated here.
 Per-tenant stacks are provisioned on-demand via:
@@ -8,11 +8,6 @@ Per-tenant stacks are provisioned on-demand via:
 
 This avoids bundling per-tenant CloudFormation stacks into the shared
 infra pipeline and lets each tenant be deployed/destroyed independently.
-
-Sprint 4.12 – 4.16 NOTE:
-    A synthetic ``TarevoTenant-synth-test`` instance is registered below to
-    validate TenantStack nag rules during ``cdk synth``.  It is NOT deployed
-    and will be removed once the full TenantStack is validated (after Sprint 4.16).
 """
 
 import os
@@ -37,11 +32,10 @@ env = cdk.Environment(
 #          tenant registry, provisioner Lambda, ECR repository.
 SharedInfraStack(app, "TarevoSharedInfra", env=env)
 
-# ── Synth-test TenantStack — validates TenantStack nag rules (Sprints 4.12–16) ──
-# NOT deployed.  Removed after Sprint 4.16 validation is complete.
-TenantStack(app, "TarevoTenant-synth-test",
-            tenant_id="synth-test",
-            listener_priority=999,
-            env=env)
+# ── Sprint 5 Phase B staging verification tenants (removed after testing) ─────
+# Note: tenant IDs must not contain hyphens — hyphens are not valid in unquoted
+# MySQL identifiers and will cause OpenEMR’s setup scripts to fail.
+TenantStack(app, "TarevoTenant-testa", tenant_id="testa", listener_priority=100, env=env)
+TenantStack(app, "TarevoTenant-testb", tenant_id="testb", listener_priority=200, env=env)
 
 app.synth()
