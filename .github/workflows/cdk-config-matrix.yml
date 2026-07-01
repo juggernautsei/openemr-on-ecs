@@ -5,6 +5,10 @@ on:
     branches:
       - main
       - develop
+      - feature/**
+      - sprint/**
+      - hotfix/**
+      - bugfix/**
   pull_request:
     branches:
       - main
@@ -45,13 +49,29 @@ jobs:
       - name: Install AWS CDK CLI
         run: |
           npm install --location=global aws-cdk@2
+      - name: Seed CDK context cache for CI
+        run: |
+          cat > cdk.context.json <<'JSON'
+          {
+            "availability-zones:account=600430252128:region=us-east-2": [
+              "us-east-2a",
+              "us-east-2b",
+              "us-east-2c"
+            ],
+            "hosted-zone:account=600430252128:domainName=tarevoehr.app:region=us-east-2": {
+              "Id": "/hostedzone/Z04523733LXLATJJ8NU9B",
+              "Name": "tarevoehr.app."
+            }
+          }
+          JSON
 
       - name: Run comprehensive configuration matrix tests
         env:
           AWS_ACCESS_KEY_ID: "fake"
           AWS_SECRET_ACCESS_KEY: "fake"
-          AWS_DEFAULT_REGION: "us-west-2"
-          CDK_DEFAULT_REGION: "us-west-2"
+          CDK_DEFAULT_ACCOUNT: "600430252128"
+          AWS_DEFAULT_REGION: "us-east-2"
+          CDK_DEFAULT_REGION: "us-east-2"
         run: |
           echo "Testing all CDK configuration combinations..."
           python3 scripts/test-cdk-synthesis.py --verbose
@@ -60,8 +80,9 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID: "fake"
           AWS_SECRET_ACCESS_KEY: "fake"
-          AWS_DEFAULT_REGION: "us-west-2"
-          CDK_DEFAULT_REGION: "us-west-2"
+          CDK_DEFAULT_ACCOUNT: "600430252128"
+          AWS_DEFAULT_REGION: "us-east-2"
+          CDK_DEFAULT_REGION: "us-east-2"
         run: |
           echo "Running bash stress test script..."
           bash scripts/stress-test.sh

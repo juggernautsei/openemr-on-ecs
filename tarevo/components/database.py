@@ -376,6 +376,7 @@ class DatabaseComponents:
         )
         # Retain cache data on CDK destroy so tenant session state isn’t lost.
         valkey.cfn_options.deletion_policy = CfnDeletionPolicy.RETAIN
+        valkey.cfn_options.update_replace_policy = CfnDeletionPolicy.RETAIN
 
         ssm.StringParameter(
             self.scope,
